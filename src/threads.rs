@@ -147,6 +147,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     if args.task.trim().is_empty() {
         bail!("the task is empty");
     }
+    project.reconcile_repositories()?;
     let (settings, _) = project.read_project_md()?;
     // Without a running ticker nothing launches.
     ticker::start(ctx)?;
@@ -170,6 +171,14 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             path
         }
     };
+    if !machine.is_empty() {
+        let (store, _) = project.open_row()?;
+        if let Some(id) = crate::remote::machine_id(ctx.runner, &ctx.env.herdr_bin(), &machine) {
+            store.resolve_environment(&machine, &id)?;
+        } else if store.environment_for_label(&machine)?.state != "resolved" {
+            bail!("`{machine}` is an unresolved environment; this command will not run there");
+        }
+    }
     if !machine.is_empty() && listed.is_none() {
         eprintln!("warning: {repo} on {machine} is not listed in `repos` in PROJECT.md");
     }

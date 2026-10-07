@@ -879,7 +879,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         let mut state = steps::load_state(project);
         let before = state.clone();
         let now = jiff::Timestamp::now();
-        let target = coordinator::nudge_target(&coordinators, now);
+        let target = coordinator::nudge_target(&coordinators, &record.pane_id, now);
         if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, target, now) {
             first_error = first_error.or(Some(error.context("nudge")));
         }
@@ -1134,13 +1134,11 @@ mod tests {
         assert_eq!(runner.count("agent prompt"), 0);
         assert_eq!(runner.count("agent start"), 0);
         let live = coordinator::live(&f.project);
-        assert_eq!(live.len(), 2);
-        assert_eq!(live[1].agent, "codex");
-        assert_eq!(live[1].agent_session, "sess-2");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].pane_id, "w1:p1");
         assert!(!live[0].pair_since.is_empty());
-        // Both coordinator panes get tokens.
         assert_eq!(runner.count("report-metadata w1:p1"), 1);
-        assert_eq!(runner.count("report-metadata w1:p2"), 1);
+        assert_eq!(runner.count("report-metadata w1:p2"), 0);
         // The primary pane's native session id is recorded for a later resume.
         assert_eq!(f.project.coordinator().unwrap().agent_session, "sess-1");
     }
@@ -1171,7 +1169,7 @@ mod tests {
         assert!(tick_project(&ctx, &f.project).unwrap());
         assert_eq!(runner.count("agent prompt"), 0);
         assert_eq!(runner.count("agent start"), 0);
-        assert_eq!(runner.count("report-metadata"), 0);
+        assert_eq!(runner.count("report-metadata w1:p1"), 1);
     }
 
     #[test]

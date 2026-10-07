@@ -9,6 +9,7 @@ mod coordinator;
 mod doctor;
 mod grouping;
 mod herdr;
+mod ids;
 mod inbox;
 mod lifecycle;
 mod names;
@@ -19,8 +20,8 @@ mod popup;
 mod pr;
 mod profiles;
 mod progress;
-mod prompt_box;
 mod project;
+mod prompt_box;
 mod remote;
 mod rename;
 mod routine;
@@ -33,6 +34,7 @@ mod setup;
 mod sidebar;
 mod spaces;
 mod steps;
+mod store;
 mod sweep;
 mod tasks;
 mod thread;
@@ -58,7 +60,11 @@ fn extend_path() {
     let _ = USER_PATH.set(current.to_string_lossy().into_owned());
     let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let mut extra: Vec<std::path::PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].iter().map(Into::into).collect();
+    let mut extra: Vec<std::path::PathBuf> =
+        ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+            .iter()
+            .map(Into::into)
+            .collect();
     if let Some(home) = home {
         extra.push(home.join(".local/bin"));
         extra.push(home.join(".cargo/bin"));

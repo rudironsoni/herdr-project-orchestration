@@ -124,13 +124,32 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
 
     let trash = ctx.root.join(".trash");
     std::fs::create_dir_all(&trash)?;
-    let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
-    let target = trash.join(format!("{slug}-{stamp}"));
+    let (store, row) = project.open_row()?;
+    let target = if let Some(operation) = store.pending_kind(&row.id, "delete_project")? {
+        let value: serde_json::Value = serde_json::from_str(&operation.payload)?;
+        std::path::PathBuf::from(value.get("trash").and_then(|item| item.as_str()).unwrap_or_default())
+    } else {
+        let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
+        let target = trash.join(format!("{slug}-{stamp}"));
+        let payload = serde_json::json!({
+            "source": row.directory,
+            "trash": target,
+        })
+        .to_string();
+        store.start_intent(&row.id, "delete_project", &payload)?;
+        target
+    };
     {
-        // Held while the folder moves, so no writer lands in between; writers
-        // re-check PROJECT.md after taking the lock and drop their write.
         let _lock = project.lock()?;
-        std::fs::rename(project.dir(), &target).with_context(|| format!("could not move {} to the trash", project.dir().display()))?;
+        if project.dir().exists() {
+            std::fs::rename(project.dir(), &target).with_context(|| format!("could not move {} to the trash", project.dir().display()))?;
+        }
+        let (store, row) = project.open_row()?;
+        store.set_lifecycle(&row.id, "deleted")?;
+        store.set_directory(&row.id, &target.to_string_lossy())?;
+        if let Some(operation) = store.pending_kind(&row.id, "delete_project")? {
+            store.finish_operation(&operation.id, "done", "")?;
+        }
     }
     println!("moved `{slug}` to {}", target.display());
 
@@ -173,7 +192,6 @@ mod tests {
         assert_eq!(trashed.len(), 1);
         assert!(trashed[0].file_name().to_string_lossy().starts_with("demo-"));
         assert!(trashed[0].path().join("PROJECT.md").is_file());
-        assert!(trashed[0].path().join("threads/t-0001.toml").is_file());
         // Nothing but herdr list calls ran: no worktree, branch or PR was touched.
         assert!(world.runner.calls.borrow().iter().all(|c| c.display().contains(" list")));
         // `.trash` is not a project.

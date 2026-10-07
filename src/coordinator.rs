@@ -48,11 +48,10 @@ pub fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
         && (pane.cwd == record.cwd || pane.foreground_cwd == record.cwd)
 }
 
-/// A coordinator of the project: any agent whose working directory is the
-/// project home (the canonical path the record stores), including one `open`
-/// started in a shell pane elsewhere.
+/// The coordinator is the bound primary pane. Another agent in the project
+/// folder is not a coordinator.
 pub fn is_coordinator(record: &Coordinator, agent: &Agent) -> bool {
-    agent.works_in(&record.cwd)
+    !record.pane_id.is_empty() && agent.pane_id == record.pane_id
 }
 
 /// The project's workspace is open when a listed pane of it works in the
@@ -142,12 +141,13 @@ pub fn save_live(project: &Project, panes: &[LivePane]) -> Result<()> {
 /// The coordinator a nudge goes to: idle for at least `NUDGE_IDLE_SECS`
 /// (`done` counts as idle), the one whose pair changed most recently when
 /// several qualify. `None` when no coordinator is that idle.
-pub fn nudge_target(panes: &[LivePane], now: jiff::Timestamp) -> Option<&LivePane> {
-    panes
-        .iter()
-        .filter(|p| crate::herdr::ready_state(&p.agent_status))
-        .filter(|p| crate::thread::seconds_since(&p.pair_since, now) >= NUDGE_IDLE_SECS)
-        .max_by_key(|p| p.state_change_seq)
+pub fn nudge_target<'a>(panes: &'a [LivePane], primary_pane: &str, now: jiff::Timestamp) -> Option<&'a LivePane> {
+    if primary_pane.is_empty() {
+        return None;
+    }
+    panes.iter().find(|pane| pane.pane_id == primary_pane).filter(|pane| crate::herdr::ready_state(&pane.agent_status)).filter(|pane| {
+        crate::thread::seconds_since(&pane.pair_since, now) >= NUDGE_IDLE_SECS
+    })
 }
 
 /// The profile a coordinator record ran: before profiles, the built-in of
@@ -182,6 +182,7 @@ fn here_pane(ctx: &Ctx, options: &OpenOptions, socket: &str, agents: &[Agent]) -
 
 pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    project.reconcile_repositories()?;
     if project.status() == Status::Archived {
         bail!("`{slug}` is archived; run `unarchive {slug}` first");
     }
@@ -240,12 +241,14 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // With an explicit profile, only the recorded coordinator is reused, and
     // only when it runs that profile: choosing another profile in the popup
     // starts one beside the others.
-    let running: Vec<&Agent> = agents
-        .iter()
-        .filter(|a| a.works_in(&cwd))
-        .filter(|a| options.profile.is_none() || previous.as_ref().is_some_and(|r| r.pane_id == a.pane_id && recorded_profile(r) == profile.name))
+    let running: Vec<&Agent> = previous
+        .as_ref()
+        .filter(|record| !record.pane_id.is_empty())
+        .and_then(|record| agents.iter().find(|a| a.pane_id == record.pane_id))
+        .filter(|a| options.profile.is_none() || previous.as_ref().is_some_and(|r| recorded_profile(r) == profile.name))
+        .into_iter()
         .collect();
-    if let Some(agent) = running.iter().max_by_key(|a| a.state_change_seq)
+    if let Some(agent) = running.first()
         && !options.new
     {
         if let Some(record) = &previous {
@@ -315,8 +318,51 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 
     // Ids are recorded before the agent is started, so a command killed midway
     // still leaves a record the ticker and a later `open` can act on.
-    let taken: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
-    let name = names::free_coordinator(slug, &taken);
+    let (store, row) = project.open_row()?;
+    let name = if let Some(operation) = store.pending_kind(&row.id, "open_coordinator")? {
+        let value: serde_json::Value = serde_json::from_str(&operation.payload)?;
+        value.get("agent_name").and_then(|item| item.as_str()).unwrap_or_default().to_string()
+    } else {
+        let taken: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+        let name = names::free_coordinator(slug, &taken);
+        let payload = serde_json::json!({
+            "socket": socket,
+            "profile": profile.name,
+            "agent_name": name,
+            "kind": kind,
+            "new": options.new,
+        })
+        .to_string();
+        store.start_intent(&row.id, "open_coordinator", &payload)?;
+        name
+    };
+    let named: Vec<_> = agents.iter().filter(|agent| agent.name == name).collect();
+    if named.len() > 1 {
+        bail!("more than one agent is named {name}; this open will not start another");
+    }
+    if let Some(agent) = named.first() {
+        project.update_coordinator(|record| {
+            record.socket = socket.clone();
+            record.workspace_id = agent.workspace_id.clone();
+            record.tab_id = agent.tab_id.clone();
+            record.pane_id = agent.pane_id.clone();
+            record.agent_name = agent.name.clone();
+            record.cwd = cwd.clone();
+            record.agent = agent.agent.clone();
+            record.profile = profile.name.clone();
+            if !agent.session_id().is_empty() {
+                record.agent_session = agent.session_id().to_string();
+            }
+        })?;
+        if let Some(operation) = store.pending_kind(&row.id, "open_coordinator")? {
+            store.finish_operation(&operation.id, "done", "")?;
+        }
+        let _ = herdr.agent_focus(&agent.pane_id);
+        ticker::start(ctx)?;
+        println!("coordinator {name} is already running in pane {}", agent.pane_id);
+        println!("Commands: {prefix}");
+        return Ok(());
+    }
     // With --new the recorded session belongs to a coordinator that stays
     // running: the new agent starts fresh and never inherits its session id.
     let resume = previous
@@ -349,7 +395,11 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     if here.is_some() {
         report_tokens(&herdr, &project, &record.pane_id);
         ticker::start(ctx)?;
-        return run_here(ctx, &herdr, &project, &record, &args, &base_args, &prefix);
+        run_here(ctx, &herdr, &project, &record, &args, &base_args, &prefix)?;
+        if let Some(operation) = store.pending_kind(&row.id, "open_coordinator")? {
+            store.finish_operation(&operation.id, "done", "")?;
+        }
+        return Ok(());
     }
     let mut started = start_when_shell_ready(&herdr, &name, &kind, &record.pane_id, &args);
     if let Err(error) = &started
@@ -379,10 +429,67 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             record.pane_id
         ),
     }
+    if let Some(operation) = store.pending_kind(&row.id, "open_coordinator")? {
+        store.finish_operation(&operation.id, "done", "")?;
+    }
     report_tokens(&herdr, &project, &record.pane_id);
     ticker::start(ctx)?;
     println!("opened `{slug}` in workspace {} (pane {})", record.workspace_id, record.pane_id);
     println!("Commands: {prefix}");
+    Ok(())
+}
+
+pub fn adopt(ctx: &Ctx, slug: &str, pane: Option<&str>, machine: Option<&str>, replace_primary: bool, flags: &crate::paths::SessionFlags) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    let chosen = pane.map(str::to_string).filter(|item| !item.is_empty()).or_else(|| ctx.env.var("HERDR_PANE_ID").filter(|item| !item.is_empty()).map(str::to_string));
+    let Some(pane) = chosen else {
+        bail!("pass --pane, or run `coordinator adopt` inside the Herdr pane");
+    };
+    let session = paths::resolve_session(flags, ctx.env, ctx.runner)?;
+    let socket = session.socket.to_string_lossy().into_owned();
+    let (store, row) = project.open_row()?;
+    if let Some(machine) = machine.filter(|item| !item.is_empty()) {
+        if let Some(id) = crate::remote::machine_id(ctx.runner, &ctx.env.herdr_bin(), machine) {
+            store.resolve_environment(machine, &id)?;
+        } else if store.environment_for_label(machine)?.state != "resolved" {
+            bail!("`{machine}` is an unresolved environment; this command will not run there");
+        }
+    }
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
+    let agents = herdr.agent_list().with_context(|| format!("the herdr session at {socket} is not reachable"))?;
+    let Some(agent) = agents.iter().find(|agent| agent.pane_id == pane) else {
+        bail!("pane {pane} is not an agent");
+    };
+    let cwd = project.canonical_dir().to_string_lossy().into_owned();
+    if !agent.works_in(&cwd) {
+        bail!("pane {pane} does not work in this project");
+    }
+    if let Some(live) = store.live_session(crate::ids::ENV_LOCAL, &socket, &pane)? {
+        if live.project_id != row.id {
+            bail!("pane {pane} is bound to another project");
+        }
+    }
+    if let Some(primary) = store.primary_session(&row.id)? {
+        let live_primary = !primary.stale && primary.unbound_at.is_none() && !primary.pane_id.is_empty();
+        if live_primary && primary.pane_id != pane && !replace_primary {
+            bail!("a live primary exists; pass --replace-primary");
+        }
+    }
+    project.update_coordinator(|record| {
+        record.socket = socket;
+        record.session = session.name.clone().unwrap_or_default();
+        record.workspace_id = agent.workspace_id.clone();
+        record.tab_id = agent.tab_id.clone();
+        record.pane_id = agent.pane_id.clone();
+        record.agent_name = agent.name.clone();
+        record.cwd = cwd;
+        record.agent = agent.agent.clone();
+        record.profile = agent.agent.clone();
+        if !agent.session_id().is_empty() {
+            record.agent_session = agent.session_id().to_string();
+        }
+    })?;
+    println!("adopted pane {pane} for `{slug}`");
     Ok(())
 }
 
@@ -514,6 +621,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
 
 pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    project.reconcile_repositories()?;
     let prefix = current_prefix(&ctx.root)?;
     let (text, shown) = digest(ctx, &project, &prefix)?;
     print!("{text}");
@@ -655,22 +763,19 @@ mod tests {
     }
 
     #[test]
-    fn a_coordinator_is_any_agent_in_the_project_folder() {
-        let record = Coordinator { cwd: "/r/demo".into(), workspace_id: "w1".into(), ..Coordinator::default() };
-        assert!(is_coordinator(&record, &agent("w1:p1", "/r/demo", "idle", 1)));
-        assert!(is_coordinator(&record, &agent("w9:p9", "/r/demo", "idle", 1)));
-        assert!(!is_coordinator(&record, &agent("w1:p1", "/r/demo/threads/t-0001", "idle", 1)));
-        assert!(!is_coordinator(&record, &agent("w1:p1", "/elsewhere", "idle", 1)));
+    fn only_the_bound_pane_is_the_coordinator() {
+        let record = Coordinator { pane_id: "w1:p1".into(), ..Coordinator::default() };
+        assert!(is_coordinator(&record, &agent("w1:p1", "/elsewhere", "idle", 1)));
+        assert!(!is_coordinator(&record, &agent("w9:p9", "/r/demo", "idle", 1)));
         let empty = Coordinator::default();
-        assert!(!is_coordinator(&empty, &agent("w1:p1", "", "idle", 1)));
-        // `open` ran it in a shell pane elsewhere: its own directory counts.
+        assert!(!is_coordinator(&empty, &agent("w1:p1", "/r/demo", "idle", 1)));
         let child = Agent { foreground_cwd: "/r/demo".into(), ..agent("w5:p1", "/tmp", "idle", 1) };
-        assert!(is_coordinator(&record, &child));
+        assert!(!is_coordinator(&record, &child));
     }
 
     #[test]
     fn discovery_keeps_pair_since_while_the_pair_is_unchanged() {
-        let record = Coordinator { cwd: "/r/demo".into(), ..Coordinator::default() };
+        let record = Coordinator { cwd: "/r/demo".into(), pane_id: "w1:p1".into(), ..Coordinator::default() };
         let first = discover(&record, &[], &[agent("w1:p1", "/r/demo", "idle", 5), agent("w2:p1", "/other", "idle", 1)], "2026-09-23T10:00:00Z");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].pair_since, "2026-09-23T10:00:00Z");
@@ -690,7 +795,10 @@ mod tests {
             pane("w1:p3", "idle", 9, "2026-09-23T10:01:30Z"),
             pane("w1:p4", "working", 12, "2026-09-23T09:00:00Z"),
         ];
-        assert_eq!(nudge_target(&panes, now).unwrap().pane_id, "w1:p2");
-        assert!(nudge_target(&panes[2..], now).is_none());
+        assert_eq!(nudge_target(&panes, "w1:p1", now).unwrap().pane_id, "w1:p1");
+        assert_eq!(nudge_target(&panes, "w1:p2", now).unwrap().pane_id, "w1:p2");
+        assert!(nudge_target(&panes, "w1:p3", now).is_none());
+        assert!(nudge_target(&panes, "w1:p4", now).is_none());
+        assert!(nudge_target(&panes, "w1:p9", now).is_none());
     }
 }

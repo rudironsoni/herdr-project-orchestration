@@ -331,11 +331,30 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     } else {
         {
             let _lock = project.lock()?;
-            std::fs::rename(&old_dir, &new_dir).with_context(|| format!("could not move {} to {}", old_dir.display(), new_dir.display()))?;
+            let (store, row) = project.open_row()?;
+            let new_directory = Path::new(&row.directory).parent().unwrap_or(Path::new(&row.directory)).join(to);
+            let payload = serde_json::json!({
+                "from": from,
+                "to": to,
+                "old_directory": row.directory,
+                "new_directory": new_directory,
+            })
+            .to_string();
+            if row.pending_slug.as_deref() != Some(to) {
+                store.reserve_slug(&row.id, to)?;
+            }
+            store.start_intent(&row.id, "rename_project", &payload)?;
+            if old_dir.exists() {
+                std::fs::rename(&old_dir, &new_dir).with_context(|| format!("could not move {} to {}", old_dir.display(), new_dir.display()))?;
+            }
+            let directory = std::fs::canonicalize(&new_dir).unwrap_or(new_directory).to_string_lossy().into_owned();
+            store.finish_rename(&row.id, &directory)?;
+            store.add_former_slug(&row.id, from)?;
+            if let Some(operation) = store.pending_kind(&row.id, "rename_project")? {
+                store.finish_operation(&operation.id, "done", "")?;
+            }
         }
-        let moved_project = Project::load(&ctx.root, to)?;
-        moved_project.add_former_slug(from)?;
-        moved_project
+        Project::load(&ctx.root, to)?
     };
     let finish = format!("; run `rename {from} {to}` again to finish");
     project.add_former_slug(from).with_context(|| finish.clone())?;

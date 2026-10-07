@@ -42,6 +42,12 @@ impl From<SessionArgs> for SessionFlags {
 }
 
 #[derive(Subcommand)]
+enum MigrateCommand {
+    /// Try a failed legacy import again
+    Retry,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Create a project folder with its skeleton files
     New {
@@ -63,6 +69,11 @@ enum Command {
         /// Include archived projects
         #[arg(long)]
         all: bool,
+    },
+    /// Legacy operational files
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
     },
     /// Open a project: start a coordinator agent in its folder, in this pane when
     /// run from a shell pane inside Herdr, else in the project's workspace
@@ -316,6 +327,21 @@ enum CoordinatorCommand {
         /// The text; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         text_file: String,
+    },
+    /// Bind one pane as the coordinator
+    Adopt {
+        slug: String,
+        /// Pane id. Inside Herdr, `HERDR_PANE_ID` is used when this is omitted.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Remote machine label. Required when the pane is not local.
+        #[arg(long)]
+        machine: Option<String>,
+        /// Replace a live primary. The old primary stays in the history.
+        #[arg(long)]
+        replace_primary: bool,
+        #[command(flatten)]
+        session: SessionArgs,
     },
 }
 
@@ -656,9 +682,30 @@ pub fn run() -> Result<()> {
             println!("next: {prefix} open {}", project.slug);
             Ok(())
         }
+        Command::Migrate { command: MigrateCommand::Retry } => {
+            let store = crate::store::Store::open(&ctx.root)?;
+            let before = store.failed_imports()?.len();
+            store.forget_failed_imports()?;
+            for slug in project::list_slugs(&ctx.root) {
+                let project = Project::load(&ctx.root, &slug)?;
+                let _ = project.open_row();
+                crate::thread::list(&project);
+            }
+            let still = store.failed_imports()?;
+            println!("{before} failed import(s) retried; {} still failing", still.len());
+            for (path, error) in &still {
+                println!("{path}: {error}");
+            }
+            Ok(())
+        }
         Command::List { all } => {
             for slug in project::list_slugs(&ctx.root) {
                 let project = Project::load(&ctx.root, &slug)?;
+                let _ = project.open_row();
+                if project.import_failed() {
+                    println!("{slug}\timport-failed\tsee doctor");
+                    continue;
+                }
                 let status = project.status();
                 if status == Status::Archived && !all {
                     continue;
@@ -689,6 +736,9 @@ pub fn run() -> Result<()> {
             CoordinatorCommand::Prompt { slug, text_file } => {
                 let text = read_text(&text_file)?;
                 coordinator::prompt(&ctx, &slug, &text)
+            }
+            CoordinatorCommand::Adopt { slug, pane, machine, replace_primary, session } => {
+                coordinator::adopt(&ctx, &slug, pane.as_deref(), machine.as_deref(), replace_primary, &session.into())
             }
         },
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),

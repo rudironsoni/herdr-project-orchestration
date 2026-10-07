@@ -54,6 +54,10 @@ fn saved(runner: &dyn Runner, herdr_bin: &str) -> Vec<SavedMachine> {
 }
 
 /// `(label, ssh target)` of every machine `herdr machine list` saves.
+pub fn machine_id(runner: &dyn Runner, herdr_bin: &str, machine: &str) -> Option<String> {
+    saved(runner, herdr_bin).into_iter().find(|item| item.label == machine || item.id == machine).map(|item| item.id).filter(|id| !id.is_empty())
+}
+
 pub fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Vec<(String, String)> {
     saved(runner, herdr_bin).into_iter().map(|m| (if m.label.is_empty() { m.id } else { m.label }, m.target)).collect()
 }

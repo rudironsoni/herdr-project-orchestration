@@ -24,6 +24,7 @@ pub struct World {
     pub panes: Rc<RefCell<String>>,
     /// The styled screen `agent read --format ansi` serves for every pane.
     pub screen: Rc<RefCell<String>>,
+    next_workspace: RefCell<std::collections::HashMap<String, u32>>,
 }
 
 /// A Claude input box, empty (dim placeholder) or holding `draft`.
@@ -48,6 +49,7 @@ impl World {
             agents: Rc::new(RefCell::new("[]".into())),
             panes: Rc::new(RefCell::new("[]".into())),
             screen: Rc::new(RefCell::new(claude_screen(None))),
+            next_workspace: RefCell::new(std::collections::HashMap::new()),
             home,
         };
         let screen = world.screen.clone();
@@ -79,8 +81,17 @@ impl World {
         }
     }
 
-    /// A project that has been opened: coordinator in `w1:p1` of `socket`.
+    /// A project that has been opened. The first project on a socket uses
+    /// `w1:p1`. The next project on that socket uses the next workspace, so
+    /// two live bindings do not share one pane.
     pub fn project(&self, slug: &str, socket: &str) -> Project {
+        let n = {
+            let mut map = self.next_workspace.borrow_mut();
+            let n = map.entry(socket.to_string()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let workspace = format!("w{n}");
         let project = project::create(&self.root, slug, "", vec![]).unwrap();
         let socket = self.home.path().join(socket);
         std::fs::write(&socket, b"").unwrap();
@@ -88,9 +99,9 @@ impl World {
         project
             .update_coordinator(|c| {
                 c.socket = socket.to_string_lossy().into_owned();
-                c.workspace_id = "w1".into();
-                c.tab_id = "w1:t1".into();
-                c.pane_id = "w1:p1".into();
+                c.workspace_id = workspace.clone();
+                c.tab_id = format!("{workspace}:t1");
+                c.pane_id = format!("{workspace}:p1");
                 c.agent_name = format!("hp-{slug}-coordinator");
                 c.cwd = cwd;
             })
@@ -99,7 +110,8 @@ impl World {
     }
 
     pub fn coordinator_pane(&self, project: &Project) -> String {
-        pane_json("w1", "w1:t1", "w1:p1", &project.canonical_dir().to_string_lossy())
+        let record = project.coordinator().unwrap();
+        pane_json(&record.workspace_id, &record.tab_id, &record.pane_id, &project.canonical_dir().to_string_lossy())
     }
 
     /// A thread record placed in pane `w2:p1`, working directory `cwd`.
@@ -451,7 +463,7 @@ fn resolving_a_merged_thread_removes_worktree_and_branch_and_an_unmerged_one_kee
         } else {
             assert!(item.summary.contains("kept: its pull request is not merged"), "{}", item.summary);
         }
-        assert!(thread::record_path(&project, "t-0001").is_file());
+        assert_eq!(thread::load(&project, "t-0001").unwrap().status, thread::Status::Resolved);
     }
 }
 
@@ -2799,10 +2811,13 @@ fn rename_run_again_after_the_move_finishes_the_rest() {
     let ctx = world.ctx();
     std::fs::create_dir_all(&ctx.config_dir).unwrap();
     std::fs::write(ctx.config_dir.join("config.toml"), format!("[safety.\"{old_s}\"]\nyolo = true\n")).unwrap();
-    // As if it stopped right after the folder moved.
+    // As if it stopped right after the folder moved and the registry slug changed.
+    let (store, row) = project.open_row().unwrap();
     std::fs::rename(project.dir(), world.root.join("demo-2")).unwrap();
+    let moved_dir = world.root.join("demo-2").canonicalize().unwrap();
+    store.set_slug(&row.id, "demo-2", &moved_dir.to_string_lossy()).unwrap();
+    store.add_former_slug(&row.id, "demo").unwrap();
     let moved = Project::load(&world.root, "demo-2").unwrap();
-    moved.add_former_slug("demo").unwrap();
 
     crate::rename::run(&ctx, &rename_args("demo", "demo-2", None, false)).unwrap();
     assert!(moved.safety(&ctx.config_dir).unwrap().yolo);

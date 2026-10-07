@@ -185,6 +185,23 @@ fn report(
     if root.is_dir() {
         let count = project::list_slugs(root).len();
         check(&mut out, Some(true), "root", format!("{count} project(s)"));
+        for slug in project::list_slugs(root) {
+            if let Ok(project) = project::Project::load(root, &slug) {
+                if let Err(error) = project.reconcile_repositories() {
+                    check(&mut out, Some(false), "repos", format!("{slug}: {error:#}"));
+                }
+            }
+        }
+        if root.join(crate::store::REGISTRY_FILE).is_file() {
+            check(&mut out, None, "registry", "migrated operational store; do not use herdr-projects 0.2.34 against this root".into());
+            if let Ok(store) = crate::store::Store::open(root) {
+                if let Ok(failed) = store.failed_imports() {
+                    for (path, error) in failed {
+                        check(&mut out, Some(false), "import", format!("{path}: {error}"));
+                    }
+                }
+            }
+        }
     } else {
         check(
             &mut out,
