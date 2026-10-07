@@ -437,17 +437,28 @@ fn report(
             "no coordinator running (start any agent in {}, or `open {slug}`)",
             project.dir().display()
         );
-        // With no usable record, the agents the ticker would discover: the
-        // ones working in the project folder in this session.
-        let (record, mut notes) = match project.coordinator() {
-            Some(record) if Path::new(&record.socket).exists() => (Some(record), Vec::new()),
-            Some(record) => (
-                None,
-                vec![format!(
-                    "recorded socket {} no longer exists",
+        // A stored primary whose socket is gone stays the primary. The ticker
+        // does not bind another agent in the project folder.
+        if crate::coordinator::primary_was_recorded(&project)
+            && crate::coordinator::reachable_coordinator(&project).is_none()
+            && let Some(record) = project.coordinator()
+        {
+            let detail = if record.socket.is_empty() {
+                format!("{}; primary unavailable", project.status())
+            } else {
+                format!(
+                    "{}; primary unavailable; recorded socket {} no longer exists",
+                    project.status(),
                     record.socket
-                )],
-            ),
+                )
+            };
+            check(&mut out, Some(false), &label, detail);
+            continue;
+        }
+        // With no primary yet, the agents the ticker would discover: the ones
+        // working in the project folder in this session.
+        let (record, mut notes) = match project.coordinator() {
+            Some(record) => (Some(record), Vec::new()),
             None => (None, Vec::new()),
         };
         let socket = match (&record, paths::resolve_session(session, env, runner)) {
@@ -1168,5 +1179,58 @@ mod tests {
         );
         assert!(!healthy);
         assert!(text.contains("[FAIL] names"), "{text}");
+    }
+
+    #[test]
+    fn a_gone_primary_socket_is_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let gone = home.path().join("gone.sock");
+        std::fs::write(&gone, b"").unwrap();
+        project
+            .update_coordinator(|c| {
+                c.socket = gone.to_string_lossy().into_owned();
+                c.pane_id = "w1:p1".into();
+                c.cwd = project.canonical_dir().to_string_lossy().into_owned();
+            })
+            .unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        let before = project.open_row().unwrap().1.primary_session_id;
+        let fallback = home.path().join(".config/herdr/herdr.sock");
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(&fallback, b"").unwrap();
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on(
+            "agent list",
+            ok(&format!(
+                r#"{{"result":{{"agents":[{{"pane_id":"w9:p9","tab_id":"w9:t1","workspace_id":"w9","name":"other","agent":"grok","cwd":"{cwd}","foreground_cwd":"{cwd}"}}]}}}}"#
+            )),
+        );
+        runner.on(
+            "pane list",
+            ok(&format!(
+                r#"{{"result":{{"panes":[{{"pane_id":"w9:p9","tab_id":"w9:t1","workspace_id":"w9","cwd":"{cwd}"}}]}}}}"#
+            )),
+        );
+        let (text, healthy) = report(
+            &env,
+            &root,
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+            false,
+            None,
+        );
+        assert!(!healthy, "{text}");
+        assert!(
+            text.contains("[FAIL] project demo:") && text.contains("primary unavailable"),
+            "{text}"
+        );
+        assert!(!text.contains("w9:p9"), "{text}");
+        assert!(!text.contains("the ticker records it"), "{text}");
+        assert_eq!(project.open_row().unwrap().1.primary_session_id, before);
     }
 }
