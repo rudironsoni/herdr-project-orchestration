@@ -24,24 +24,23 @@ pub struct SessionView<'a> {
     pub panes: Vec<Pane>,
 }
 
-/// `None` when the project's session is unreachable, or it has no usable
-/// record and no agent works in its folder in the current session.
+/// `None` when the project's session is unreachable. A recorded primary whose
+/// socket file is gone is not replaced by another agent in the project folder.
+/// With no primary yet, an agent already working in that folder is only a
+/// read-only view. The ticker records a primary on its next tick.
 pub fn session_view<'a>(ctx: &'a Ctx, project: &Project) -> Option<SessionView<'a>> {
-    let record = match project
-        .coordinator()
-        .filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists())
-    {
-        Some(record) => record,
-        None => {
-            let session =
-                crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner).ok()?;
-            let socket = session.socket.to_string_lossy().into_owned();
-            let agents = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner)
-                .agent_list()
-                .ok()?;
-            // Read only: the ticker records it on its next tick.
-            crate::coordinator::found(project, &socket, &session.name.unwrap_or_default(), &agents)?
-        }
+    let record = if let Some(record) = coordinator::reachable_coordinator(project) {
+        record
+    } else if coordinator::primary_was_recorded(project) {
+        return None;
+    } else {
+        let session =
+            crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner).ok()?;
+        let socket = session.socket.to_string_lossy().into_owned();
+        let agents = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner)
+            .agent_list()
+            .ok()?;
+        crate::coordinator::found(project, &socket, &session.name.unwrap_or_default(), &agents)?
     };
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
     let agents = herdr.agent_list().ok()?;

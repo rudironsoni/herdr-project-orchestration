@@ -505,10 +505,10 @@ impl Sessions {
     }
 }
 
-/// A project with no record, or one whose socket is gone: the first agent
-/// working in the project folder, in the default session or any session
-/// another project uses, becomes its coordinator and is recorded just as
-/// `open` records one. Agents in `threads/` or a worktree are threads.
+/// A project with no recorded primary: the first agent working in the project
+/// folder, in the default session or any session another project uses, becomes
+/// its coordinator. A recorded primary whose socket is gone is not replaced.
+/// Agents in `threads/` or a worktree are threads.
 fn discover_record(
     ctx: &Ctx,
     project: &Project,
@@ -1061,17 +1061,18 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
 
 /// Returns `Ok(None)` when the project's session cannot be reached, or it has
 /// no record and no agent works in its folder: then no state is read, so
-/// nothing is ever reported as gone.
+/// nothing is ever reported as gone. A recorded primary whose socket file is
+/// gone stays the primary.
 fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<Option<Seen>> {
-    let recorded = project
-        .coordinator()
-        .filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists());
-    let record = match recorded {
-        Some(record) => record,
-        None => match discover_record(ctx, project, sessions)? {
+    let record = if let Some(record) = coordinator::reachable_coordinator(project) {
+        record
+    } else if coordinator::primary_was_recorded(project) {
+        return Ok(None);
+    } else {
+        match discover_record(ctx, project, sessions)? {
             Some(record) => record,
             None => return Ok(None),
-        },
+        }
     };
     let Some((agents, panes)) = sessions.get(ctx, &record.socket).cloned() else {
         return Ok(None);
@@ -1575,8 +1576,8 @@ mod tests {
         };
         assert!(!tick_project(&ctx, &f.project).unwrap());
 
-        // A socket file that is gone is not even called; only the default
-        // session is looked in for an agent in the project folder.
+        // A recorded socket that is gone is not called, and another session
+        // is not asked for a replacement coordinator.
         let gone = f.project.coordinator().unwrap().socket;
         std::fs::remove_file(&gone).unwrap();
         let runner = FakeRunner::new();
@@ -1596,6 +1597,50 @@ mod tests {
                 .all(|c| !c.env.iter().any(|(_, v)| *v == gone))
         );
         assert_eq!(runner.count("agent list"), 0);
+    }
+
+    #[test]
+    fn a_gone_socket_does_not_adopt_a_directory_agent() {
+        let f = fixture();
+        let before = {
+            let (_store, row) = f.project.open_row().unwrap();
+            assert!(row.primary_session_id.is_some());
+            row.primary_session_id.clone()
+        };
+        let gone = f.project.coordinator().unwrap().socket;
+        std::fs::remove_file(&gone).unwrap();
+        let fallback = f.env.home.join(".config/herdr/herdr.sock");
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(&fallback, b"").unwrap();
+        let runner = FakeRunner::new();
+        let agent = with_cwd(
+            &AGENT_READY
+                .replace("w1:p1", "w9:p9")
+                .replace("hpc-demo", "other"),
+            &f,
+        );
+        runner.on("agent list", ok(&agent));
+        runner.on(
+            "pane list",
+            ok(&with_cwd(PANE, &f).replace("w1:p1", "w9:p9")),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        assert!(!tick_project(&ctx, &f.project).unwrap());
+        let (store, row) = f.project.open_row().unwrap();
+        assert_eq!(row.primary_session_id, before);
+        assert_eq!(
+            store.primary_session(&row.id).unwrap().unwrap().pane_id,
+            "w1:p1"
+        );
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert!(crate::threads::session_view(&ctx, &f.project).is_none());
     }
 
     #[test]

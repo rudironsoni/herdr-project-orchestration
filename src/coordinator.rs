@@ -77,6 +77,20 @@ pub fn project_workspace(record: &Coordinator, panes: &[Pane]) -> Option<String>
         .map(|p| p.workspace_id.clone())
 }
 
+/// The primary session while its Herdr socket file is still there.
+pub fn reachable_coordinator(project: &Project) -> Option<Coordinator> {
+    project
+        .coordinator()
+        .filter(|record| !record.socket.is_empty() && Path::new(&record.socket).exists())
+}
+
+/// A primary session was stored. A missing socket file does not clear it.
+pub fn primary_was_recorded(project: &Project) -> bool {
+    project
+        .coordinator()
+        .is_some_and(|record| !record.socket.is_empty() || !record.pane_id.is_empty())
+}
+
 /// The record `open` would write for the most recently active agent working
 /// in the project folder. `None` when no agent in `agents` works there.
 pub fn found(
