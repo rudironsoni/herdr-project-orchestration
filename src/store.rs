@@ -1653,6 +1653,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn start_intent_rejects_a_different_payload() {
+        let (_dir, store) = fresh();
+        let project = project(&store, "a");
+        let (id, created) = store
+            .start_intent(&project.id, "rename_project", "{\"to\":\"b\"}")
+            .unwrap();
+        assert!(created);
+        let (again, created) = store
+            .start_intent(&project.id, "rename_project", "{\"to\":\"b\"}")
+            .unwrap();
+        assert!(!created);
+        assert_eq!(again, id);
+        let err = store
+            .start_intent(&project.id, "rename_project", "{\"to\":\"c\"}")
+            .unwrap_err();
+        assert!(err.to_string().contains("different intent"), "{err:?}");
+        let pending = store
+            .pending_kind(&project.id, "rename_project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.id, id);
+        assert_eq!(pending.payload, "{\"to\":\"b\"}");
+    }
+
     fn is_constraint(err: &anyhow::Error) -> bool {
         let text = format!("{err:?}");
         text.contains("constraint")
