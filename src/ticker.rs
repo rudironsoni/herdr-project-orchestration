@@ -1643,6 +1643,136 @@ mod tests {
         assert!(crate::threads::session_view(&ctx, &f.project).is_none());
     }
 
+    /// A directory agent on the default session, for a primary that must not be replaced.
+    fn fallback_directory_agent(f: &Fixture) -> FakeRunner {
+        let fallback = f.env.home.join(".config/herdr/herdr.sock");
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(&fallback, b"").unwrap();
+        let runner = FakeRunner::new();
+        let agent = with_cwd(
+            &AGENT_READY
+                .replace("w1:p1", "w9:p9")
+                .replace("hpc-demo", "other"),
+            f,
+        );
+        runner.on("agent list", ok(&agent));
+        runner.on(
+            "pane list",
+            ok(&with_cwd(PANE, f).replace("w1:p1", "w9:p9")),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner
+    }
+
+    fn ctx<'a>(f: &'a Fixture, runner: &'a FakeRunner) -> Ctx<'a> {
+        Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner,
+            detached_ticker: false,
+        }
+    }
+
+    #[test]
+    fn a_changed_agent_kind_on_the_same_session_is_stored() {
+        let f = fixture();
+        // The stored session already matches the live one, so only the agent
+        // kind differs. A flipped kind compare would leave "claude" in place.
+        f.project
+            .update_coordinator(|c| {
+                c.agent_session = "sess-1".into();
+                c.agent = "claude".into();
+            })
+            .unwrap();
+        let listed = with_cwd(
+            &AGENT_READY.replace(
+                r#""agent":"claude","agent_status":"idle""#,
+                r#""agent":"codex","agent_status":"idle""#,
+            ),
+            &f,
+        );
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(&listed));
+        runner.on("pane list", ok(&with_cwd(PANE, &f)));
+        runner.on("report-metadata", ok("{}"));
+        assert!(tick_project(&ctx(&f, &runner), &f.project).unwrap());
+        let record = f.project.coordinator().unwrap();
+        assert_eq!(record.agent, "codex");
+        assert_eq!(record.agent_session, "sess-1");
+    }
+
+    #[test]
+    fn the_primary_pane_terminal_selects_its_progress_record() {
+        let f = fixture();
+        let socket = f.project.coordinator().unwrap().socket;
+        crate::progress::save(
+            &f.root,
+            &crate::progress::Record {
+                socket,
+                pane_id: "w1:p1".into(),
+                terminal_id: "term-match".into(),
+                activity: crate::progress::WAITING.into(),
+                reported_at: 1_700_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cwd = f.project.dir().to_string_lossy().into_owned();
+        let listed = format!(
+            r#"{{"result":{{"agents":[{{"pane_id":"w9:p9","tab_id":"w1:t9","workspace_id":"w1","name":"other","agent":"claude","agent_status":"idle","cwd":"{cwd}","terminal_id":"term-other","state_change_seq":1,"agent_session":{{"value":"sess-other"}}}},{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","name":"hpc-demo","agent":"claude","agent_status":"idle","cwd":"{cwd}","terminal_id":"term-match","state_change_seq":4,"agent_session":{{"value":"sess-1"}}}}]}}}}"#
+        );
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(&listed));
+        runner.on("pane list", ok(&with_cwd(PANE, &f)));
+        runner.on("report-metadata", ok("{}"));
+        assert!(tick_project(&ctx(&f, &runner), &f.project).unwrap());
+        let line = runner
+            .calls
+            .borrow()
+            .iter()
+            .find(|cmd| cmd.display().contains("report-metadata w1:p1"))
+            .map(|cmd| cmd.display())
+            .unwrap_or_default();
+        assert!(
+            line.contains("hp_rank=1"),
+            "the waiting record on term-match must rank the primary pane, got {line}"
+        );
+    }
+
+    #[test]
+    fn a_socket_without_a_pane_is_not_replaced() {
+        let f = fixture();
+        let gone = f.project.coordinator().unwrap().socket;
+        std::fs::remove_file(&gone).unwrap();
+        f.project.update_coordinator(|c| c.pane_id.clear()).unwrap();
+        let before = f.project.open_row().unwrap().1.primary_session_id;
+        let runner = fallback_directory_agent(&f);
+        assert!(!tick_project(&ctx(&f, &runner), &f.project).unwrap());
+        let (store, row) = f.project.open_row().unwrap();
+        assert_eq!(row.primary_session_id, before);
+        assert_eq!(store.primary_session(&row.id).unwrap().unwrap().pane_id, "");
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert!(crate::threads::session_view(&ctx(&f, &runner), &f.project).is_none());
+    }
+
+    #[test]
+    fn a_pane_without_a_socket_is_not_replaced() {
+        let f = fixture();
+        f.project.update_coordinator(|c| c.socket.clear()).unwrap();
+        let before = f.project.open_row().unwrap().1.primary_session_id;
+        let runner = fallback_directory_agent(&f);
+        assert!(!tick_project(&ctx(&f, &runner), &f.project).unwrap());
+        let (store, row) = f.project.open_row().unwrap();
+        assert_eq!(row.primary_session_id, before);
+        assert_eq!(
+            store.primary_session(&row.id).unwrap().unwrap().pane_id,
+            "w1:p1"
+        );
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert!(crate::threads::session_view(&ctx(&f, &runner), &f.project).is_none());
+    }
+
     #[test]
     fn log_is_capped() {
         let dir = tempfile::tempdir().unwrap();

@@ -1654,6 +1654,8 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::Env;
+    use crate::runner::fake::{FakeRunner, ok};
 
     fn now() -> jiff::Timestamp {
         "2026-09-17T12:00:00Z".parse().unwrap()
@@ -1866,5 +1868,126 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".herdr-project/x")).unwrap();
         std::fs::write(repo.path().join(".herdr-project/x/report.md"), "r").unwrap();
         assert!(String::from_utf8_lossy(&run(&["status", "--porcelain"]).stdout).is_empty());
+    }
+
+    fn brief_project() -> (tempfile::TempDir, Project, String) {
+        let home = tempfile::tempdir().unwrap();
+        let project = project::create(&home.path().join("root"), "demo", "", vec![]).unwrap();
+        let cwd = project.dir().to_string_lossy().into_owned();
+        (home, project, cwd)
+    }
+
+    #[test]
+    fn local_brief_names_the_thread_directory() {
+        let (home, project, cwd) = brief_project();
+        let placed = thread::allocate(&project, |t| {
+            t.kind = Kind::Tab;
+            t.status = Status::Open;
+            t.cwd = cwd.clone();
+        })
+        .unwrap();
+        assert!(placed.thread_dir.is_empty());
+        let runner = FakeRunner::new();
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: home.path().join("root"),
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        write_brief_local(&ctx, &project, &placed, false).unwrap();
+        let dir = thread::thread_dir(&cwd, &project.slug, &placed.id);
+        let brief = std::fs::read_to_string(Path::new(&dir).join("brief.md")).unwrap();
+        assert!(brief.contains(&format!("{dir}/report.md")), "{brief}");
+    }
+
+    #[test]
+    fn remote_brief_names_the_thread_directory() {
+        let (home, project, cwd) = brief_project();
+        let placed = thread::allocate(&project, |t| {
+            t.kind = Kind::Tab;
+            t.status = Status::Open;
+            t.cwd = cwd.clone();
+            t.machine = "box".into();
+        })
+        .unwrap();
+        let config_dir = home.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[machines.box]\nssh = \"box\"\n",
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on("ssh", ok(""));
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: home.path().join("root"),
+            config_dir,
+            runner: &runner,
+            detached_ticker: false,
+        };
+        write_brief(&ctx, &project, &placed, false).unwrap();
+        let dir = thread::thread_dir(&cwd, &project.slug, &placed.id);
+        let brief = runner
+            .calls
+            .borrow()
+            .iter()
+            .find(|cmd| cmd.program == "ssh")
+            .and_then(|cmd| cmd.stdin.clone())
+            .unwrap_or_default();
+        assert!(brief.contains(&format!("{dir}/report.md")), "{brief}");
+    }
+
+    #[test]
+    fn an_unread_report_file_is_ready_for_review() {
+        let (home, project, cwd) = brief_project();
+        let socket = home.path().join("herdr.sock");
+        std::fs::write(&socket, b"").unwrap();
+        project
+            .update_coordinator(|c| {
+                c.socket = socket.to_string_lossy().into_owned();
+                c.pane_id = "w1:p1".into();
+                c.cwd = cwd.clone();
+            })
+            .unwrap();
+        let allocated = thread::allocate(&project, |t| {
+            t.kind = Kind::Tab;
+            t.status = Status::Open;
+            t.cwd = cwd.clone();
+            t.pane_id = "w1:p1".into();
+            t.prompt_pending = false;
+        })
+        .unwrap();
+        let dir = thread::thread_dir(&cwd, &project.slug, &allocated.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(Path::new(&dir).join("report.md"), b"done").unwrap();
+        thread::update(&project, &allocated.id, |t| {
+            t.thread_dir = dir;
+            t.report_hash.clear();
+            t.acked_report_hash.clear();
+        })
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        runner.on(
+            "pane list",
+            ok(&format!(
+                r#"{{"result":{{"panes":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{cwd}"}}]}}}}"#
+            )),
+        );
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: home.path().join("root"),
+            config_dir: home.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let found = rows(&ctx, &project);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].group, Group::ReadyForReview);
     }
 }
