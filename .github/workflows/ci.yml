@@ -9,32 +9,34 @@ permissions:
   contents: read
 
 jobs:
+  quality:
+    name: ubuntu / 1.89
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup default 1.89.0
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets
+
   test:
-    name: ${{ matrix.os }} / ${{ matrix.rust }}
+    name: ${{ matrix.os }} / stable
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            rust: 1.89.0
-          - os: ubuntu-24.04
-            rust: stable
-          - os: macos-14
-            rust: stable
+        os: [ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-
       - name: Install Rust
         run: |
-          rustup toolchain install ${{ matrix.rust }} --profile minimal
-          rustup default ${{ matrix.rust }}
-
-      - name: Format
-        run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - name: Test
         run: cargo test --locked --all-targets

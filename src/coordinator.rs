@@ -76,6 +76,7 @@ pub fn found(project: &Project, socket: &str, session: &str, agents: &[Agent]) -
     let cwd = project.canonical_dir().to_string_lossy().into_owned();
     let agent = agents.iter().filter(|a| a.works_in(&cwd)).max_by_key(|a| a.state_change_seq)?;
     Some(Coordinator {
+        environment_id: crate::ids::ENV_LOCAL.into(),
         socket: socket.to_string(),
         session: session.to_string(),
         workspace_id: agent.workspace_id.clone(),
@@ -261,6 +262,9 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             if c.pane_id != agent.pane_id {
                 c.profile = agent.agent.clone();
             }
+            if c.environment_id.is_empty() {
+                c.environment_id = crate::ids::ENV_LOCAL.into();
+            }
             c.socket = socket.clone();
             c.session = session_name;
             c.workspace_id = agent.workspace_id.clone();
@@ -280,15 +284,36 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         return Ok(());
     }
 
-    // Start in the pane this command runs in, else reuse the recorded pane
-    // when it is still there at a shell prompt, else add a tab to the
-    // project's workspace, else make the workspace.
     let panes = herdr.pane_list()?;
     let here = here_pane(ctx, options, &socket, &agents);
+    let (store, row) = project.open_row()?;
+    let name = if let Some(operation) = store.pending_kind(&row.id, "open_coordinator")? {
+        let value: serde_json::Value = serde_json::from_str(&operation.payload)?;
+        value.get("agent_name").and_then(|item| item.as_str()).unwrap_or_default().to_string()
+    } else {
+        let taken: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+        let name = names::free_coordinator(slug, &taken);
+        let need_workspace = here.is_none()
+            && previous.as_ref().is_none_or(|record| record.workspace_id.is_empty());
+        let payload = serde_json::json!({
+            "socket": socket,
+            "profile": profile.name,
+            "agent_name": name,
+            "kind": kind,
+            "new": options.new,
+            "environment_id": crate::ids::ENV_LOCAL,
+            "need_workspace": need_workspace,
+        })
+        .to_string();
+        store.start_intent(&row.id, "open_coordinator", &payload)?;
+        name
+    };
     let reusable = previous.as_ref().filter(|record| {
         !options.new && panes.iter().any(|p| pane_matches(record, p)) && !agents.iter().any(|a| a.pane_id == record.pane_id)
     });
-    let (workspace_id, tab_id, pane_id) = if let Some(pane) = &here {
+    let (workspace_id, tab_id, pane_id) = if let Some(record) = previous.as_ref().filter(|record| record.agent_name == name && !record.workspace_id.is_empty() && !record.pane_id.is_empty()) {
+        (record.workspace_id.clone(), record.tab_id.clone(), record.pane_id.clone())
+    } else if let Some(pane) = &here {
         let pane = panes.iter().find(|p| &p.pane_id == pane).with_context(|| format!("pane {pane} is not listed by the herdr session at {socket}"))?;
         (pane.workspace_id.clone(), pane.tab_id.clone(), pane.pane_id.clone())
     } else if let Some(record) = reusable {
@@ -315,33 +340,15 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         };
         (created.workspace_id, created.tab_id, created.pane_id)
     };
-
-    // Ids are recorded before the agent is started, so a command killed midway
-    // still leaves a record the ticker and a later `open` can act on.
-    let (store, row) = project.open_row()?;
-    let name = if let Some(operation) = store.pending_kind(&row.id, "open_coordinator")? {
-        let value: serde_json::Value = serde_json::from_str(&operation.payload)?;
-        value.get("agent_name").and_then(|item| item.as_str()).unwrap_or_default().to_string()
-    } else {
-        let taken: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
-        let name = names::free_coordinator(slug, &taken);
-        let payload = serde_json::json!({
-            "socket": socket,
-            "profile": profile.name,
-            "agent_name": name,
-            "kind": kind,
-            "new": options.new,
-        })
-        .to_string();
-        store.start_intent(&row.id, "open_coordinator", &payload)?;
-        name
-    };
     let named: Vec<_> = agents.iter().filter(|agent| agent.name == name).collect();
     if named.len() > 1 {
         bail!("more than one agent is named {name}; this open will not start another");
     }
     if let Some(agent) = named.first() {
         project.update_coordinator(|record| {
+            if record.environment_id.is_empty() {
+                record.environment_id = crate::ids::ENV_LOCAL.into();
+            }
             record.socket = socket.clone();
             record.workspace_id = agent.workspace_id.clone();
             record.tab_id = agent.tab_id.clone();
@@ -372,6 +379,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         .unwrap_or_default();
     let record = project.update_coordinator(|c| {
         *c = Coordinator {
+            environment_id: crate::ids::ENV_LOCAL.into(),
             socket: socket.clone(),
             session: session.name.clone().unwrap_or_default(),
             workspace_id,
@@ -448,23 +456,34 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: Option<&str>, machine: Option<&str>, r
     let session = paths::resolve_session(flags, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
     let (store, row) = project.open_row()?;
-    if let Some(machine) = machine.filter(|item| !item.is_empty()) {
-        if let Some(id) = crate::remote::machine_id(ctx.runner, &ctx.env.herdr_bin(), machine) {
-            store.resolve_environment(machine, &id)?;
-        } else if store.environment_for_label(machine)?.state != "resolved" {
-            bail!("`{machine}` is an unresolved environment; this command will not run there");
-        }
-    }
+    let environment_id = if let Some(machine) = machine.filter(|item| !item.is_empty()) {
+        let environment = if let Some(id) = crate::remote::machine_id(ctx.runner, &ctx.env.herdr_bin(), machine) {
+            store.resolve_environment(machine, &id)?
+        } else {
+            let environment = store.environment_for_label(machine)?;
+            if environment.state != "resolved" {
+                bail!("`{machine}` is an unresolved environment; this command will not run there");
+            }
+            environment
+        };
+        environment.id
+    } else {
+        crate::ids::ENV_LOCAL.to_string()
+    };
     let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
+    let herdr = match machine.filter(|item| !item.is_empty()) {
+        Some(machine) => herdr.on_machine(machine),
+        None => herdr,
+    };
     let agents = herdr.agent_list().with_context(|| format!("the herdr session at {socket} is not reachable"))?;
     let Some(agent) = agents.iter().find(|agent| agent.pane_id == pane) else {
         bail!("pane {pane} is not an agent");
     };
     let cwd = project.canonical_dir().to_string_lossy().into_owned();
-    if !agent.works_in(&cwd) {
+    if machine.is_none() && !agent.works_in(&cwd) {
         bail!("pane {pane} does not work in this project");
     }
-    if let Some(live) = store.live_session(crate::ids::ENV_LOCAL, &socket, &pane)? {
+    if let Some(live) = store.live_session(&environment_id, &socket, &pane)? {
         if live.project_id != row.id {
             bail!("pane {pane} is bound to another project");
         }
@@ -476,6 +495,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: Option<&str>, machine: Option<&str>, r
         }
     }
     project.update_coordinator(|record| {
+        record.environment_id = environment_id;
         record.socket = socket;
         record.session = session.name.clone().unwrap_or_default();
         record.workspace_id = agent.workspace_id.clone();

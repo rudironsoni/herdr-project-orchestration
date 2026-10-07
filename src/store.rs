@@ -1211,6 +1211,17 @@ impl Store {
         Ok(())
     }
 
+    pub fn import_record(&self, path: &str) -> Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT status, error FROM legacy_imports WHERE path = ?1",
+                [path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn import_status(&self, path: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
@@ -1747,7 +1758,7 @@ mod tests {
         legacy.sort();
         thread_toml.sort();
         assert_eq!(sql, ["store.rs"]);
-        assert_eq!(legacy, ["project.rs"]);
-        assert_eq!(thread_toml, ["thread.rs"]);
+        assert_eq!(legacy, ["legacy_import.rs"]);
+        assert_eq!(thread_toml, ["legacy_import.rs"]);
     }
 }

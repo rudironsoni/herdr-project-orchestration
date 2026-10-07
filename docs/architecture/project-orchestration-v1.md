@@ -67,7 +67,7 @@ Two projects may record the same primary checkout `cwd`. They may not own the sa
 
 ## 6. Persistence
 
-The registry is `<projects-root>/registry.sqlite`, opened with `rusqlite` and the bundled SQLite. WAL is set on the file. Every connection sets `foreign_keys = ON` and `busy_timeout = 5000`. Schema version is 1.
+The registry is `<projects-root>/registry.sqlite`, opened with `rusqlite` and the bundled SQLite. WAL is set on the file. Every connection sets `foreign_keys = ON` and `busy_timeout = 5000`. Schema version is 2. `projects.pending_slug` reserves a rename target.
 
 `PROJECT.md` remains the writer for name, goal, instructions, profile names, limits, and repo membership. SQLite does not store a second writable copy of those. Repository rows are a projection. `context`, `thread start`, `open`, and `doctor` reconcile when a hash of the `repos` table changes.
 
@@ -103,7 +103,7 @@ Archive sets lifecycle to `archived` and keeps files and rows. Delete moves the 
 
 ## 13. Recovery
 
-`create_project`, `rename_project`, `bind_session`, `archive_project`, and `delete_project` record an operation before the side effect. A pending create with no directory resumes. A done project whose directory disappears becomes `missing` and is not recreated. A bind whose terminal id changed unbinds the old session and does not route to it.
+`create_project`, `rename_project`, and `delete_project` record an operation before the filesystem effect. `open_coordinator` records its intent, including whether a new workspace is required, before Herdr creates a workspace, a tab, or an agent. A retry reuses that workspace and tab. `coordinator adopt` records the session with the environment id of the named machine. Archive is one SQLite transaction and does not move files, so it has no filesystem recovery step. A pending create with no directory resumes. A done project whose directory disappears becomes `missing` and is not recreated. A session whose terminal id changed is stale. Routing does not select another pane.
 
 ## 14. Authority
 
@@ -121,6 +121,6 @@ Milestone 1 is the registry, the primary session, adopt, and the proof below. It
 
 `cargo test` is necessary and is not sufficient. Milestone 1 is accepted only when the evidence shows SQLite is the operational store, poisoned legacy files do not change behavior, legacy operational files are not rewritten, import preserves field meaning, recovery follows the operation row, concurrent processes do not duplicate or cross-wire state, routing uses the primary session, pane reuse rebinds on `terminal_id`, repository edits reconcile before repo-dependent work, and an unresolved machine degrades only that environment.
 
-Proof is real SQLite constraint tests, hand-written 0.2.34 fixtures, a poison test, a new store instance after restart, process-level races, CLI subprocess checks, a boundary check in CI, and a disposable Herdr run. `.github/workflows/release.yml` only builds release binaries. `.github/workflows/ci.yml` runs format, clippy, and `cargo test --locked` on Linux (Rust 1.89 and stable) and macOS (stable).
+Proof is real SQLite constraint tests, hand-written 0.2.34 fixtures, a poison test, a new store instance after restart, process-level races, CLI subprocess checks, a boundary check in CI, and a disposable Herdr run. `.github/workflows/release.yml` only builds release binaries. `.github/workflows/ci.yml` runs format, clippy, and `cargo test --locked` on Linux with Rust 1.89. Linux stable and macOS stable run `cargo test --locked` only. Legacy operational files are parsed only in `src/legacy_import.rs`.
 
 Milestone 1 stops when that evidence is reported. Milestone 2 does not start in the same batch.

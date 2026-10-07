@@ -218,12 +218,12 @@ impl std::fmt::Display for Status {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-struct ProjectState {
-    status: Status,
+pub(crate) struct ProjectState {
+    pub(crate) status: Status,
     /// Slugs the project had before `rename`, oldest first: its threads'
     /// branches (`hp/<slug>/...`) keep the name they were made with.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    former_slugs: Vec<String>,
+    pub(crate) former_slugs: Vec<String>,
 }
 
 /// The session and workspace the project belongs to, and the coordinator pane
@@ -232,6 +232,8 @@ struct ProjectState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct Coordinator {
+    /// `env_local` or the remote environment id. Empty means local.
+    pub environment_id: String,
     pub socket: String,
     /// Empty when the session was chosen by socket path alone.
     pub session: String,
@@ -334,10 +336,20 @@ impl Project {
             root: root.to_path_buf(),
             slug: slug.to_string(),
         };
-        if !project.project_md().is_file() {
-            bail!("no project `{slug}` in {}", root.display());
+        if project.project_md().is_file() {
+            return Ok(project);
         }
-        Ok(project)
+        if root.join(crate::store::REGISTRY_FILE).is_file() {
+            if let Ok(store) = Store::open(root) {
+                if let Ok(Some(row)) = store.project_by_slug(slug) {
+                    if row.availability != "missing" {
+                        let _ = store.set_availability(&row.id, "missing");
+                    }
+                    return Ok(project);
+                }
+            }
+        }
+        bail!("no project `{slug}` in {}", root.display());
     }
 
     pub fn dir(&self) -> PathBuf {
@@ -386,8 +398,7 @@ impl Project {
         let store = Store::open(&self.root)?;
         let slug = self.slug.clone();
         let directory = self.canonical_dir().to_string_lossy().into_owned();
-        let state_path = self.state_dir().join("project.json");
-        let coordinator_path = self.state_dir().join("coordinator.json");
+        let (state_path, coordinator_path) = crate::legacy_import::operational_paths(self);
         let row = store.immediate(|store| {
             store.reconcile_observed()?;
             if let Some(row) = store.project_by_slug(&slug)? {
@@ -406,35 +417,18 @@ impl Project {
             if store.import_status(&directory)?.as_deref() == Some("failed") {
                 bail!("project `{slug}` did not import; `doctor` names the file");
             }
-            let legacy = if state_path.is_file() {
-                match read_json::<ProjectState>(&state_path) {
-                    Some(state) => state,
-                    None => bail!("project.json does not parse"),
-                }
-            } else {
-                ProjectState::default()
-            };
-            let coordinator = if coordinator_path.is_file() {
-                match read_json::<Coordinator>(&coordinator_path) {
-                    Some(record) => Some(record),
-                    None => bail!("coordinator.json does not parse"),
-                }
-            } else {
-                None
-            };
-            let lifecycle = match legacy.status {
-                Status::Paused => "paused",
-                Status::Archived => "archived",
-                Status::Active => "active",
-            };
-            let row = store.insert_project(&slug, &directory, lifecycle)?;
-            for former in &legacy.former_slugs {
+            let (lifecycle, former_slugs, coordinator) =
+                crate::legacy_import::read_project_state(&state_path, &coordinator_path)?;
+            let row = store.insert_project(&slug, &directory, &lifecycle)?;
+            for former in &former_slugs {
                 store.add_former_slug(&row.id, former)?;
             }
             if let Some(record) = coordinator.filter(|record| !record.pane_id.is_empty()) {
                 store.save_primary(&row.id, &draft_from_coordinator(&record))?;
             }
-            store.note_import(&directory, "imported", "", Some(&row.id))?;
+            let thread_errors = crate::legacy_import::read_thread_files(store, self, &row.id)?;
+            let status = if thread_errors.is_empty() { "imported" } else { "imported" };
+            store.note_import(&directory, status, &thread_errors, Some(&row.id))?;
             Ok(row)
         });
         let row = match row {
@@ -583,6 +577,7 @@ impl Project {
 
 fn coordinator_from_session(session: &crate::store::SessionRow) -> Coordinator {
     Coordinator {
+        environment_id: session.environment_id.clone(),
         socket: session.herdr_socket.clone(),
         session: session.herdr_session_name.clone(),
         workspace_id: session.workspace_herdr_id.clone(),
@@ -599,7 +594,11 @@ fn coordinator_from_session(session: &crate::store::SessionRow) -> Coordinator {
 
 fn draft_from_coordinator(record: &Coordinator) -> SessionDraft {
     SessionDraft {
-        environment_id: ENV_LOCAL.into(),
+        environment_id: if record.environment_id.is_empty() {
+            ENV_LOCAL.into()
+        } else {
+            record.environment_id.clone()
+        },
         herdr_socket: record.socket.clone(),
         pane_id: record.pane_id.clone(),
         terminal_id: String::new(),
@@ -1051,6 +1050,78 @@ mod tests {
         for typed in ["GTM AI", "my project", "Demo", "herdr-Projects"] {
             assert_eq!(display_name(typed, "x"), typed);
         }
+    }
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dest = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_frozen_v0_2_34_tree_imports_its_fields_and_keeps_the_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-v0.2.34/basic");
+        copy_tree(&fixture, &root.path().join("basic"));
+        let state = root.path().join("basic/.state/project.json");
+        let before = std::fs::read(&state).unwrap();
+        let project = Project::load(root.path(), "basic").unwrap();
+        assert_eq!(project.status(), Status::Paused);
+        assert_eq!(project.former_slugs(), ["old-name"]);
+        assert_eq!(project.coordinator().unwrap().pane_id, "w1:p1");
+        assert_eq!(crate::thread::load(&project, "t-0001").unwrap().title, "Keep");
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        let mixed = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-v0.2.34/one-bad-thread");
+        copy_tree(&mixed, &root.path().join("mixed"));
+        let mixed_project = Project::load(root.path(), "mixed").unwrap();
+        assert_eq!(crate::thread::load(&mixed_project, "t-0001").unwrap().title, "Good");
+        assert!(crate::thread::load(&mixed_project, "t-0002").is_err());
+    }
+
+    #[test]
+    fn a_pending_create_resumes_once_and_a_pending_rename_keeps_one_id() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path()).unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let directory = root.path().join("demo");
+        let row = store.insert_project("demo", &directory.to_string_lossy(), "active").unwrap();
+        let payload = serde_json::json!({
+            "slug": "demo",
+            "directory": directory,
+            "name": "Demo",
+            "goal": "",
+            "repos": []
+        })
+        .to_string();
+        store.start_intent(&row.id, "create_project", &payload).unwrap();
+        let project = create(root.path(), "Demo", "", vec![]).unwrap();
+        assert!(project.project_md().is_file());
+        assert_eq!(project.project_id().unwrap(), row.id);
+        assert!(create(root.path(), "Demo", "", vec![]).is_err());
+        let id = project.project_id().unwrap();
+        let (store, current) = project.open_row().unwrap();
+        store.reserve_slug(&current.id, "omega").unwrap();
+        let new_directory = root.path().join("omega");
+        let rename_payload = serde_json::json!({
+            "from": "demo",
+            "to": "omega",
+            "old_directory": current.directory,
+            "new_directory": new_directory,
+        })
+        .to_string();
+        store.start_intent(&current.id, "rename_project", &rename_payload).unwrap();
+        std::fs::rename(project.dir(), &new_directory).unwrap();
+        let again = Project::load(root.path(), "omega").unwrap();
+        assert_eq!(again.project_id().unwrap(), id);
+        assert_eq!(store.project_by_slug("omega").unwrap().unwrap().id, id);
+        assert!(Store::open(root.path()).unwrap().project_by_slug("demo").unwrap().is_none() || again.former_slugs().iter().any(|slug| slug == "demo"));
     }
 
     #[test]

@@ -132,7 +132,7 @@ fn concurrent_list_imports_a_legacy_project_once() {
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .unwrap();
     assert_eq!(projects, 1);
-    assert_eq!(imports, 2);
+    assert_eq!(imports, 1);
     assert_eq!(check, "ok");
 }
 
@@ -156,6 +156,32 @@ fn migrate_retry_imports_a_repaired_project_json() {
     assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
     let listed = hp(home.path(), &["--root", root_arg, "list"]);
     assert_eq!(String::from_utf8_lossy(&listed.stdout), "demo\tpaused\tno threads\n");
+}
+
+#[test]
+fn two_processes_cannot_create_the_same_project() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap().to_string();
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let home = home.path().to_path_buf();
+        let root_arg = root_arg.clone();
+        handles.push(std::thread::spawn(move || hp(&home, &["--root", &root_arg, "new", "demo"])));
+    }
+    let mut created = 0;
+    let mut refused = 0;
+    for handle in handles {
+        if handle.join().unwrap().status.success() {
+            created += 1;
+        } else {
+            refused += 1;
+        }
+    }
+    assert!(created >= 1, "refused {refused}");
+    let database = rusqlite::Connection::open(root.join("registry.sqlite")).unwrap();
+    let projects: i64 = database.query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0)).unwrap();
+    assert_eq!(projects, 1);
 }
 
 #[test]

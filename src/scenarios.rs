@@ -2955,3 +2955,75 @@ fn a_pending_rename_closes_a_busy_agent_after_the_wait_and_reports_a_failure() {
     assert!(!path.exists() && project.dir().is_dir());
     assert!(crate::inbox::unhandled(&project).iter().any(|i| i.event == "rename failed"));
 }
+
+#[test]
+fn a_missing_directory_keeps_the_project_id() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let id = project.project_id().unwrap();
+    std::fs::remove_dir_all(project.dir()).unwrap();
+    let again = Project::load(&world.root, "demo").unwrap();
+    assert_eq!(again.project_id().unwrap(), id);
+    assert_eq!(again.availability().unwrap(), "missing");
+    assert!(!again.dir().exists());
+    assert!(Project::load(&world.root, "nobody").is_err());
+}
+
+#[test]
+fn open_records_intent_before_a_workspace_and_a_retry_does_not_create_another() {
+    let world = World::new();
+    let project = project::create(&world.root, "demo", "Ship it", vec![]).unwrap();
+    let socket = world.home.path().join("a.sock");
+    std::fs::write(&socket, b"").unwrap();
+    let root = world.root.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("workspace create"),
+        move |_| {
+            let store = crate::store::Store::open(&root).unwrap();
+            let row = store.project_by_slug("demo").unwrap().unwrap();
+            assert!(store.pending_kind(&row.id, "open_coordinator").unwrap().is_some());
+            Ok(ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1"}}}"#))
+        },
+    );
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace get", ok(r#"{"result":{"workspace":{"label":"Demo"}}}"#));
+    world.runner.on("agent focus", ok(r#"{"result":{}}"#));
+    world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"}}}"#));
+    let options = crate::coordinator::OpenOptions {
+        session: crate::paths::SessionFlags { session: None, socket: Some(socket) },
+        rebind: false,
+        profile: None,
+        new: false,
+        here: false,
+    };
+    coordinator::open(&world.ctx(), &project.slug, &options).unwrap();
+    assert_eq!(world.runner.count("workspace create"), 1);
+    coordinator::open(&world.ctx(), &project.slug, &options).unwrap();
+    assert_eq!(world.runner.count("workspace create"), 1);
+    assert_eq!(project.project_id().unwrap(), Project::load(&world.root, "demo").unwrap().project_id().unwrap());
+}
+
+#[test]
+fn adopt_on_a_named_machine_stores_that_environment() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = project.canonical_dir().to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w9", "w9:t1", "w9:p4", &cwd, "remote-agent", "idle"));
+    world.runner.on("machine list", ok(r#"[{"id":"mach_1","label":"box","target":"box.example"}]"#));
+    let socket = world.home.path().join("a.sock");
+    coordinator::adopt(
+        &world.ctx(),
+        "demo",
+        Some("w9:p4"),
+        Some("box"),
+        true,
+        &crate::paths::SessionFlags { session: None, socket: Some(socket.clone()) },
+    )
+    .unwrap();
+    let (store, row) = project.open_row().unwrap();
+    let primary = store.primary_session(&row.id).unwrap().unwrap();
+    assert_ne!(primary.environment_id, crate::ids::ENV_LOCAL);
+    assert_eq!(primary.pane_id, "w9:p4");
+    assert!(world.runner.calls.borrow().iter().any(|cmd| cmd.display().contains("--machine") && cmd.display().contains("box")));
+    let _ = socket;
+}

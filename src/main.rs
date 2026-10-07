@@ -11,6 +11,7 @@ mod grouping;
 mod herdr;
 mod ids;
 mod inbox;
+mod legacy_import;
 mod lifecycle;
 mod names;
 mod notify;

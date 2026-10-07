@@ -168,6 +168,20 @@ pub fn home_report_path(project: &Project, id: &str) -> PathBuf {
     threads_dir(project).join(format!("{id}.md"))
 }
 
+pub(crate) fn ingest_legacy(store: &crate::store::Store, project_id: &str, text: &str) -> Result<()> {
+    let thread = from_toml(text)?;
+    let workspace_id = workspace_for(store, project_id, &thread)?;
+    let body = serde_json::to_string(&thread)?;
+    store.save_thread(
+        project_id,
+        &thread.id,
+        lifecycle_of(&thread),
+        workspace_id.as_deref(),
+        &body,
+    )?;
+    Ok(())
+}
+
 pub fn from_toml(text: &str) -> Result<Thread> {
     toml::from_str(text).context("thread record does not parse")
 }
@@ -241,66 +255,16 @@ fn workspace_for(
 
 fn import_legacy_threads(project: &Project) -> Result<()> {
     let (store, row) = project.open_row()?;
-    let row_id = row.id.clone();
-    let directory = row.directory.clone();
-    store.immediate(|store| {
-        let marker = format!("{directory}#threads");
-        if store.import_status(&marker)?.as_deref() == Some("imported") {
+    if let Some((status, error)) = store.import_record(&row.directory)? {
+        if status == "imported" && error.is_empty() {
             return Ok(());
         }
-        let mut failed = false;
-        if let Ok(entries) = std::fs::read_dir(threads_dir(project)) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let Some(id) = name.strip_suffix(".toml").map(str::to_string) else {
-                    continue;
-                };
-                let path_key = entry.path().to_string_lossy().into_owned();
-                if validate_id(&id).is_err() {
-                    store.note_import(&path_key, "failed", "not a thread id", Some(&row_id))?;
-                    failed = true;
-                    continue;
-                }
-                if store.thread_by_label(&row_id, &id)?.is_some() {
-                    continue;
-                }
-                let text = match std::fs::read_to_string(entry.path()) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        store.note_import(&path_key, "failed", &error.to_string(), Some(&row_id))?;
-                        failed = true;
-                        continue;
-                    }
-                };
-                let thread = match from_toml(&text) {
-                    Ok(thread) => thread,
-                    Err(error) => {
-                        store.note_import(&path_key, "failed", &format!("{error:#}"), Some(&row_id))?;
-                        failed = true;
-                        continue;
-                    }
-                };
-                let workspace_id = workspace_for(store, &row_id, &thread)?;
-                let body = serde_json::to_string(&thread)?;
-                store.save_thread(
-                    &row_id,
-                    &thread.id,
-                    lifecycle_of(&thread),
-                    workspace_id.as_deref(),
-                    &body,
-                )?;
-            }
-        }
-        if failed {
-            store.note_import(
-                &marker,
-                "failed",
-                "a thread record did not parse",
-                Some(&row_id),
-            )?;
-        } else {
-            store.note_import(&marker, "imported", "", Some(&row_id))?;
-        }
+    }
+    let directory = row.directory.clone();
+    let row_id = row.id.clone();
+    store.immediate(|store| {
+        let errors = crate::legacy_import::read_thread_files(store, project, &row_id)?;
+        store.note_import(&directory, "imported", &errors, Some(&row_id))?;
         Ok(())
     })
 }
