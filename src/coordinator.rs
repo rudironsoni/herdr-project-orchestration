@@ -97,6 +97,7 @@ pub fn found(
         workspace_id: agent.workspace_id.clone(),
         tab_id: agent.tab_id.clone(),
         pane_id: agent.pane_id.clone(),
+        terminal_id: agent.terminal_id.clone(),
         agent_name: agent.name.clone(),
         cwd,
         agent: agent.agent.clone(),
@@ -324,6 +325,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             c.workspace_id = agent.workspace_id.clone();
             c.tab_id = agent.tab_id.clone();
             c.pane_id = agent.pane_id.clone();
+            c.terminal_id = agent.terminal_id.clone();
             c.agent_name = agent.name.clone();
             c.cwd = cwd.clone();
             c.agent = agent.agent.clone();
@@ -439,6 +441,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             record.workspace_id = agent.workspace_id.clone();
             record.tab_id = agent.tab_id.clone();
             record.pane_id = agent.pane_id.clone();
+            record.terminal_id = agent.terminal_id.clone();
             record.agent_name = agent.name.clone();
             record.cwd = cwd.clone();
             record.agent = agent.agent.clone();
@@ -478,7 +481,12 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             session: session.name.clone().unwrap_or_default(),
             workspace_id,
             tab_id,
-            pane_id,
+            pane_id: pane_id.clone(),
+            terminal_id: panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .map(|pane| pane.terminal_id.clone())
+                .unwrap_or_default(),
             agent_name: name.clone(),
             cwd: cwd.clone(),
             agent: kind.clone(),
@@ -528,9 +536,13 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     match started {
         Ok(agent) => {
             let session_id = agent.session_id().to_string();
+            let terminal_id = agent.terminal_id.clone();
             project.update_coordinator(|c| {
                 if !session_id.is_empty() {
                     c.agent_session = session_id;
+                }
+                if !terminal_id.is_empty() {
+                    c.terminal_id = terminal_id;
                 }
             })?;
             if resume.is_empty() {
@@ -634,6 +646,7 @@ pub fn adopt(
         record.workspace_id = agent.workspace_id.clone();
         record.tab_id = agent.tab_id.clone();
         record.pane_id = agent.pane_id.clone();
+        record.terminal_id = agent.terminal_id.clone();
         record.agent_name = agent.name.clone();
         record.cwd = cwd;
         record.agent = agent.agent.clone();
@@ -716,9 +729,13 @@ fn adopt_here(herdr: &Herdr, project: &Project, record: &Coordinator) -> bool {
         let _ = herdr.agent_rename(&agent.pane_id, &record.agent_name);
     }
     let session_id = agent.session_id().to_string();
+    let terminal_id = agent.terminal_id.clone();
     let _ = project.update_coordinator(|c| {
         if !session_id.is_empty() {
             c.agent_session = session_id;
+        }
+        if !terminal_id.is_empty() {
+            c.terminal_id = terminal_id;
         }
     });
     true

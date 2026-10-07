@@ -240,6 +240,7 @@ pub struct Coordinator {
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
+    pub terminal_id: String,
     pub agent_name: String,
     /// The canonical project folder.
     pub cwd: String,
@@ -581,6 +582,7 @@ fn coordinator_from_session(session: &crate::store::SessionRow) -> Coordinator {
         workspace_id: session.workspace_herdr_id.clone(),
         tab_id: session.tab_id.clone(),
         pane_id: session.pane_id.clone(),
+        terminal_id: session.terminal_id.clone(),
         agent_name: session.agent_name.clone(),
         cwd: session.cwd.clone(),
         agent: session.agent_kind.clone(),
@@ -599,7 +601,7 @@ fn draft_from_coordinator(record: &Coordinator) -> SessionDraft {
         },
         herdr_socket: record.socket.clone(),
         pane_id: record.pane_id.clone(),
-        terminal_id: String::new(),
+        terminal_id: record.terminal_id.clone(),
         workspace_herdr_id: record.workspace_id.clone(),
         tab_id: record.tab_id.clone(),
         agent_name: record.agent_name.clone(),
@@ -1136,6 +1138,65 @@ mod tests {
                 .is_none()
                 || again.former_slugs().iter().any(|slug| slug == "demo")
         );
+    }
+
+    #[test]
+    fn a_changed_repo_list_keeps_the_remaining_id() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "", vec![]).unwrap();
+        let write = |body: &str| {
+            std::fs::write(project.project_md(), body).unwrap();
+        };
+        write(
+            "+++\nname = \"Demo\"\n[[repos]]\npath = \"/repos/one\"\n[[repos]]\npath = \"/repos/two\"\n+++\n",
+        );
+        assert!(project.reconcile_repositories().unwrap());
+        let (store, row) = project.open_row().unwrap();
+        let rows = store.repos(&row.id).unwrap();
+        let one = rows
+            .iter()
+            .find(|repo| repo.path == "/repos/one")
+            .unwrap()
+            .id
+            .clone();
+        let two = rows
+            .iter()
+            .find(|repo| repo.path == "/repos/two")
+            .unwrap()
+            .id
+            .clone();
+        write(
+            "+++\nname = \"Demo\"\n[[repos]]\npath = \"/repos/two\"\n[[repos]]\npath = \"/repos/one\"\n+++\n",
+        );
+        assert!(!project.reconcile_repositories().unwrap());
+        write("+++\nname = \"Demo\"\n[[repos]]\npath = \"/repos/one\"\n+++\n");
+        assert!(project.reconcile_repositories().unwrap());
+        let rows = store.repos(&row.id).unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|repo| repo.path == "/repos/one")
+                .unwrap()
+                .id,
+            one
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|repo| repo.path == "/repos/one")
+                .unwrap()
+                .removed
+        );
+        let removed = rows.iter().find(|repo| repo.path == "/repos/two").unwrap();
+        assert_eq!(removed.id, two);
+        assert!(removed.removed);
+        write(
+            "+++\nname = \"Demo\"\n[[repos]]\npath = \"/repos/one\"\n[[repos]]\npath = \"/repos/two\"\n+++\n",
+        );
+        assert!(project.reconcile_repositories().unwrap());
+        let rows = store.repos(&row.id).unwrap();
+        let restored = rows.iter().find(|repo| repo.path == "/repos/two").unwrap();
+        assert_eq!(restored.id, two);
+        assert!(!restored.removed);
     }
 
     #[test]

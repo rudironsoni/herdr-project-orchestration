@@ -1493,6 +1493,91 @@ mod tests {
     }
 
     #[test]
+    fn save_primary_keeps_the_session_until_the_terminal_changes() {
+        let (_dir, store) = fresh();
+        let project = project(&store, "a");
+        let first = store
+            .save_primary(&project.id, &draft("/a.sock", "w1:p1", "term-a"))
+            .unwrap();
+        let again = store
+            .save_primary(&project.id, &draft("/a.sock", "w1:p1", "term-a"))
+            .unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.terminal_id, "term-a");
+        let rebound = store
+            .save_primary(&project.id, &draft("/a.sock", "w1:p1", "term-b"))
+            .unwrap();
+        assert_ne!(rebound.id, first.id);
+        assert_eq!(rebound.terminal_id, "term-b");
+        assert_eq!(
+            store.primary_session(&project.id).unwrap().unwrap().id,
+            rebound.id
+        );
+        let old = store.session_by_id(&first.id).unwrap();
+        assert!(old.unbound_at.is_some());
+        assert!(old.stale);
+    }
+
+    #[test]
+    fn observed_create_and_delete_finish_the_pending_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let source = dir.path().join("demo");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("PROJECT.md"), "+++\nname = \"Demo\"\n+++\n").unwrap();
+        let project = store
+            .insert_project("demo", &source.to_string_lossy(), "active")
+            .unwrap();
+        store
+            .start_intent(
+                &project.id,
+                "create_project",
+                &serde_json::json!({ "directory": source }).to_string(),
+            )
+            .unwrap();
+        store.reconcile_observed().unwrap();
+        assert!(
+            store
+                .pending_kind(&project.id, "create_project")
+                .unwrap()
+                .is_none()
+        );
+
+        let trash = dir.path().join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        std::fs::copy(source.join("PROJECT.md"), trash.join("PROJECT.md")).unwrap();
+        store
+            .start_intent(
+                &project.id,
+                "delete_project",
+                &serde_json::json!({ "source": source, "trash": trash }).to_string(),
+            )
+            .unwrap();
+        store.reconcile_observed().unwrap();
+        assert!(
+            store
+                .pending_kind(&project.id, "delete_project")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.project_by_id(&project.id).unwrap().lifecycle,
+            "active"
+        );
+        std::fs::remove_file(source.join("PROJECT.md")).unwrap();
+        store.reconcile_observed().unwrap();
+        assert!(
+            store
+                .pending_kind(&project.id, "delete_project")
+                .unwrap()
+                .is_none()
+        );
+        let row = store.project_by_id(&project.id).unwrap();
+        assert_eq!(row.lifecycle, "deleted");
+        assert_eq!(row.directory, trash.to_string_lossy());
+    }
+
+    #[test]
     fn two_projects_may_share_a_checkout_but_not_a_managed_root() {
         let (_dir, store) = fresh();
         let a = project(&store, "a");

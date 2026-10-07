@@ -4856,8 +4856,7 @@ fn adopt_on_a_named_machine_stores_that_environment() {
     let project = world.project("demo", "a.sock");
     let cwd = project.canonical_dir().to_string_lossy().into_owned();
     *world.agents.borrow_mut() = format!(
-        "[{}]",
-        agent_json("w9", "w9:t1", "w9:p4", &cwd, "remote-agent", "idle")
+        r#"[{{"pane_id":"w9:p4","tab_id":"w9:t1","workspace_id":"w9","cwd":"{cwd}","name":"remote-agent","agent":"claude","agent_status":"idle","terminal_id":"term_live"}}]"#
     );
     world.runner.on(
         "machine list",
@@ -4880,6 +4879,7 @@ fn adopt_on_a_named_machine_stores_that_environment() {
     let primary = store.primary_session(&row.id).unwrap().unwrap();
     assert_ne!(primary.environment_id, crate::ids::ENV_LOCAL);
     assert_eq!(primary.pane_id, "w9:p4");
+    assert_eq!(primary.terminal_id, "term_live");
     assert!(
         world
             .runner
