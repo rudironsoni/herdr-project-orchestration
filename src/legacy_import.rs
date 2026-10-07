@@ -12,7 +12,10 @@ pub fn operational_paths(project: &Project) -> (PathBuf, PathBuf) {
     (state.join("project.json"), state.join("coordinator.json"))
 }
 
-pub fn read_project_state(state_path: &Path, coordinator_path: &Path) -> Result<(String, Vec<String>, Option<Coordinator>)> {
+pub fn read_project_state(
+    state_path: &Path,
+    coordinator_path: &Path,
+) -> Result<(String, Vec<String>, Option<Coordinator>)> {
     let legacy = if state_path.is_file() {
         match crate::project::read_json::<ProjectState>(state_path) {
             Some(state) => state,

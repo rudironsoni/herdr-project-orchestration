@@ -339,15 +339,14 @@ impl Project {
         if project.project_md().is_file() {
             return Ok(project);
         }
-        if root.join(crate::store::REGISTRY_FILE).is_file() {
-            if let Ok(store) = Store::open(root) {
-                if let Ok(Some(row)) = store.project_by_slug(slug) {
-                    if row.availability != "missing" {
-                        let _ = store.set_availability(&row.id, "missing");
-                    }
-                    return Ok(project);
-                }
+        if root.join(crate::store::REGISTRY_FILE).is_file()
+            && let Ok(store) = Store::open(root)
+            && let Ok(Some(row)) = store.project_by_slug(slug)
+        {
+            if row.availability != "missing" {
+                let _ = store.set_availability(&row.id, "missing");
             }
+            return Ok(project);
         }
         bail!("no project `{slug}` in {}", root.display());
     }
@@ -427,8 +426,7 @@ impl Project {
                 store.save_primary(&row.id, &draft_from_coordinator(&record))?;
             }
             let thread_errors = crate::legacy_import::read_thread_files(store, self, &row.id)?;
-            let status = if thread_errors.is_empty() { "imported" } else { "imported" };
-            store.note_import(&directory, status, &thread_errors, Some(&row.id))?;
+            store.note_import(&directory, "imported", &thread_errors, Some(&row.id))?;
             Ok(row)
         });
         let row = match row {
@@ -449,7 +447,10 @@ impl Project {
             .iter()
             .map(|repo| (repo.path.clone(), repo.machine.clone().unwrap_or_default()))
             .collect();
-        let view: Vec<(&str, &str)> = pairs.iter().map(|(path, machine)| (path.as_str(), machine.as_str())).collect();
+        let view: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(path, machine)| (path.as_str(), machine.as_str()))
+            .collect();
         let (store, row) = self.open_row()?;
         store.reconcile_repos(&row.id, &view)
     }
@@ -459,18 +460,15 @@ impl Project {
             return false;
         };
         let directory = self.canonical_dir().to_string_lossy().into_owned();
-        store
-            .import_status(&directory)
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some("failed")
+        store.import_status(&directory).ok().flatten().as_deref() == Some("failed")
     }
 
+    #[allow(dead_code)]
     pub fn project_id(&self) -> Result<String> {
         Ok(self.open_row()?.1.id)
     }
 
+    #[allow(dead_code)]
     pub fn availability(&self) -> Result<String> {
         Ok(self.open_row()?.1.availability)
     }
@@ -974,14 +972,9 @@ fn write_created_files(project: &Project, settings: &Settings) -> Result<()> {
     }
     let front = toml::to_string(settings)?;
     let dir = project.dir();
-    std::fs::create_dir(&dir).or_else(|error| {
-        if dir.is_dir() {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    })
-    .with_context(|| format!("could not create {}", dir.display()))?;
+    std::fs::create_dir(&dir)
+        .or_else(|error| if dir.is_dir() { Ok(()) } else { Err(error) })
+        .with_context(|| format!("could not create {}", dir.display()))?;
     for sub in SUBDIRS {
         std::fs::create_dir_all(dir.join(sub))?;
     }
@@ -1068,7 +1061,8 @@ mod tests {
     #[test]
     fn a_frozen_v0_2_34_tree_imports_its_fields_and_keeps_the_bytes() {
         let root = tempfile::tempdir().unwrap();
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-v0.2.34/basic");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/legacy-v0.2.34/basic");
         copy_tree(&fixture, &root.path().join("basic"));
         let state = root.path().join("basic/.state/project.json");
         let before = std::fs::read(&state).unwrap();
@@ -1076,12 +1070,19 @@ mod tests {
         assert_eq!(project.status(), Status::Paused);
         assert_eq!(project.former_slugs(), ["old-name"]);
         assert_eq!(project.coordinator().unwrap().pane_id, "w1:p1");
-        assert_eq!(crate::thread::load(&project, "t-0001").unwrap().title, "Keep");
+        assert_eq!(
+            crate::thread::load(&project, "t-0001").unwrap().title,
+            "Keep"
+        );
         assert_eq!(std::fs::read(&state).unwrap(), before);
-        let mixed = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-v0.2.34/one-bad-thread");
+        let mixed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/legacy-v0.2.34/one-bad-thread");
         copy_tree(&mixed, &root.path().join("mixed"));
         let mixed_project = Project::load(root.path(), "mixed").unwrap();
-        assert_eq!(crate::thread::load(&mixed_project, "t-0001").unwrap().title, "Good");
+        assert_eq!(
+            crate::thread::load(&mixed_project, "t-0001").unwrap().title,
+            "Good"
+        );
         assert!(crate::thread::load(&mixed_project, "t-0002").is_err());
     }
 
@@ -1091,7 +1092,9 @@ mod tests {
         std::fs::create_dir_all(root.path()).unwrap();
         let store = Store::open(root.path()).unwrap();
         let directory = root.path().join("demo");
-        let row = store.insert_project("demo", &directory.to_string_lossy(), "active").unwrap();
+        let row = store
+            .insert_project("demo", &directory.to_string_lossy(), "active")
+            .unwrap();
         let payload = serde_json::json!({
             "slug": "demo",
             "directory": directory,
@@ -1100,7 +1103,9 @@ mod tests {
             "repos": []
         })
         .to_string();
-        store.start_intent(&row.id, "create_project", &payload).unwrap();
+        store
+            .start_intent(&row.id, "create_project", &payload)
+            .unwrap();
         let project = create(root.path(), "Demo", "", vec![]).unwrap();
         assert!(project.project_md().is_file());
         assert_eq!(project.project_id().unwrap(), row.id);
@@ -1116,12 +1121,21 @@ mod tests {
             "new_directory": new_directory,
         })
         .to_string();
-        store.start_intent(&current.id, "rename_project", &rename_payload).unwrap();
+        store
+            .start_intent(&current.id, "rename_project", &rename_payload)
+            .unwrap();
         std::fs::rename(project.dir(), &new_directory).unwrap();
         let again = Project::load(root.path(), "omega").unwrap();
         assert_eq!(again.project_id().unwrap(), id);
         assert_eq!(store.project_by_slug("omega").unwrap().unwrap().id, id);
-        assert!(Store::open(root.path()).unwrap().project_by_slug("demo").unwrap().is_none() || again.former_slugs().iter().any(|slug| slug == "demo"));
+        assert!(
+            Store::open(root.path())
+                .unwrap()
+                .project_by_slug("demo")
+                .unwrap()
+                .is_none()
+                || again.former_slugs().iter().any(|slug| slug == "demo")
+        );
     }
 
     #[test]
@@ -1183,7 +1197,11 @@ mod tests {
         let dir = root.path().join("demo");
         std::fs::create_dir_all(dir.join(".state")).unwrap();
         std::fs::create_dir_all(dir.join("threads")).unwrap();
-        std::fs::write(dir.join("PROJECT.md"), "+++\nname = \"Demo\"\ngoal = \"Ship\"\n+++\n").unwrap();
+        std::fs::write(
+            dir.join("PROJECT.md"),
+            "+++\nname = \"Demo\"\ngoal = \"Ship\"\n+++\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("MEMORY.md"), "# Memory\n").unwrap();
         std::fs::write(dir.join("TASKS.md"), "# Tasks\n").unwrap();
         let project = Project::load(root.path(), "demo").unwrap();
@@ -1207,7 +1225,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&task, "do the work\n").unwrap();
-        let before = [file_hash(&state), file_hash(&coordinator), file_hash(&record)];
+        let before = [
+            file_hash(&state),
+            file_hash(&coordinator),
+            file_hash(&record),
+        ];
 
         assert_eq!(project.status(), Status::Paused);
         assert_eq!(project.former_slugs(), ["old-name"]);
@@ -1222,20 +1244,43 @@ mod tests {
         assert_eq!(thread.pr, "https://github.com/acme/app/pull/4");
         assert_eq!(thread.cwd, "/wt");
         assert_eq!(
-            [file_hash(&state), file_hash(&coordinator), file_hash(&record)],
+            [
+                file_hash(&state),
+                file_hash(&coordinator),
+                file_hash(&record)
+            ],
             before
         );
         let id = project.project_id().unwrap();
 
-        std::fs::write(&state, "{\"status\":\"archived\",\"former_slugs\":[\"bogus\"]}\n").unwrap();
-        std::fs::write(&coordinator, "{\"socket\":\"/other\",\"pane_id\":\"w9:p9\"}\n").unwrap();
-        std::fs::write(&record, "id = \"t-0001\"\ntitle = \"LIE\"\nstatus = \"resolved\"\n").unwrap();
-        let poisoned = [file_hash(&state), file_hash(&coordinator), file_hash(&record)];
+        std::fs::write(
+            &state,
+            "{\"status\":\"archived\",\"former_slugs\":[\"bogus\"]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &coordinator,
+            "{\"socket\":\"/other\",\"pane_id\":\"w9:p9\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &record,
+            "id = \"t-0001\"\ntitle = \"LIE\"\nstatus = \"resolved\"\n",
+        )
+        .unwrap();
+        let poisoned = [
+            file_hash(&state),
+            file_hash(&coordinator),
+            file_hash(&record),
+        ];
         assert_ne!(poisoned, before);
         assert_eq!(project.status(), Status::Paused);
         assert_eq!(project.former_slugs(), ["old-name"]);
         assert_eq!(project.coordinator().unwrap().pane_id, "w1:p1");
-        assert_eq!(crate::thread::load(&project, "t-0001").unwrap().title, "Keep");
+        assert_eq!(
+            crate::thread::load(&project, "t-0001").unwrap().title,
+            "Keep"
+        );
 
         project.set_status(Status::Active).unwrap();
         project
@@ -1243,7 +1288,11 @@ mod tests {
             .unwrap();
         crate::thread::update(&project, "t-0001", |thread| thread.title = "Next".into()).unwrap();
         assert_eq!(
-            [file_hash(&state), file_hash(&coordinator), file_hash(&record)],
+            [
+                file_hash(&state),
+                file_hash(&coordinator),
+                file_hash(&record)
+            ],
             poisoned
         );
         std::fs::remove_file(&state).unwrap();

@@ -156,10 +156,6 @@ fn threads_dir(project: &Project) -> PathBuf {
     project.dir().join("threads")
 }
 
-pub fn record_path(project: &Project, id: &str) -> PathBuf {
-    threads_dir(project).join(format!("{id}.toml"))
-}
-
 pub fn task_path(project: &Project, id: &str) -> PathBuf {
     threads_dir(project).join(format!("{id}.task.md"))
 }
@@ -168,7 +164,11 @@ pub fn home_report_path(project: &Project, id: &str) -> PathBuf {
     threads_dir(project).join(format!("{id}.md"))
 }
 
-pub(crate) fn ingest_legacy(store: &crate::store::Store, project_id: &str, text: &str) -> Result<()> {
+pub(crate) fn ingest_legacy(
+    store: &crate::store::Store,
+    project_id: &str,
+    text: &str,
+) -> Result<()> {
     let thread = from_toml(text)?;
     let workspace_id = workspace_for(store, project_id, &thread)?;
     let body = serde_json::to_string(&thread)?;
@@ -255,10 +255,11 @@ fn workspace_for(
 
 fn import_legacy_threads(project: &Project) -> Result<()> {
     let (store, row) = project.open_row()?;
-    if let Some((status, error)) = store.import_record(&row.directory)? {
-        if status == "imported" && error.is_empty() {
-            return Ok(());
-        }
+    if let Some((status, error)) = store.import_record(&row.directory)?
+        && status == "imported"
+        && error.is_empty()
+    {
+        return Ok(());
     }
     let directory = row.directory.clone();
     let row_id = row.id.clone();

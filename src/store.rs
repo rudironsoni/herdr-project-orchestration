@@ -30,6 +30,7 @@ CREATE TABLE environments (
 );
 CREATE UNIQUE INDEX environments_one_local ON environments(kind) WHERE kind = 'local';
 CREATE UNIQUE INDEX environments_machine ON environments(herdr_machine_id) WHERE herdr_machine_id IS NOT NULL;
+CREATE UNIQUE INDEX environments_label ON environments(label) WHERE label != '';
 
 CREATE TABLE projects (
     id TEXT PRIMARY KEY,
@@ -296,6 +297,7 @@ pub struct ProjectRow {
     pub directory: String,
 }
 
+#[allow(dead_code)]
 pub struct OperationRow {
     pub id: String,
     pub project_id: String,
@@ -402,6 +404,7 @@ fn configure(conn: &Connection) -> Result<()> {
     bail!("could not set WAL within the busy timeout");
 }
 
+#[allow(dead_code)]
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root)
@@ -631,30 +634,29 @@ impl Store {
         draft: &SessionDraft,
         make_primary: bool,
     ) -> Result<SessionRow> {
-        if !draft.pane_id.is_empty() {
-            if let Some(live) =
+        if !draft.pane_id.is_empty()
+            && let Some(live) =
                 self.live_session(&draft.environment_id, &draft.herdr_socket, &draft.pane_id)?
-            {
-                if live.project_id != project_id {
-                    bail!(
-                        "pane {} on {} is already bound to another project",
-                        draft.pane_id,
-                        draft.herdr_socket
-                    );
+        {
+            if live.project_id != project_id {
+                bail!(
+                    "pane {} on {} is already bound to another project",
+                    draft.pane_id,
+                    draft.herdr_socket
+                );
+            }
+            if live.terminal_id == draft.terminal_id {
+                if make_primary {
+                    self.promote(&live)?;
                 }
-                if live.terminal_id == draft.terminal_id {
-                    if make_primary {
-                        self.promote(&live)?;
-                    }
-                    return Ok(live);
-                }
-                self.conn.execute(
+                return Ok(live);
+            }
+            self.conn.execute(
                     "UPDATE sessions SET unbound_at = ?1, stale = 1, role = 'secondary', updated_at = ?1 WHERE id = ?2",
                     params![now(), live.id],
                 )?;
-                if live.role == "primary" {
-                    self.set_primary(project_id, None)?;
-                }
+            if live.role == "primary" {
+                self.set_primary(project_id, None)?;
             }
         }
         let id = ids::SessionId::new().to_string();
@@ -961,10 +963,22 @@ impl Store {
             return Ok(row);
         }
         let id = ids::EnvironmentId::new().to_string();
-        self.conn.execute(
+        if let Err(error) = self.conn.execute(
             "INSERT INTO environments (id, kind, herdr_machine_id, label, state) VALUES (?1, 'ssh', NULL, ?2, 'unresolved')",
             params![id, label],
-        )?;
+        ) {
+            if error.to_string().contains("UNIQUE") {
+                return self
+                    .conn
+                    .query_row(
+                        "SELECT id, kind, herdr_machine_id, label, state FROM environments WHERE label = ?1 AND kind = 'ssh'",
+                        [label],
+                        read_env,
+                    )
+                    .map_err(Into::into);
+            }
+            return Err(error.into());
+        }
         self.conn
             .query_row(
                 "SELECT id, kind, herdr_machine_id, label, state FROM environments WHERE id = ?1",
@@ -1011,7 +1025,13 @@ impl Store {
             .query_row(
                 "SELECT id, status, payload FROM operations WHERE idempotency_key = ?1",
                 [key],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
         {
@@ -1033,13 +1053,15 @@ impl Store {
         Ok((id, true))
     }
 
-    pub fn start_intent(&self, project_id: &str, kind: &str, payload: &str) -> Result<(String, bool)> {
+    pub fn start_intent(
+        &self,
+        project_id: &str,
+        kind: &str,
+        payload: &str,
+    ) -> Result<(String, bool)> {
         if let Some(existing) = self.pending_kind(project_id, kind)? {
             if existing.payload != payload {
-                bail!(
-                    "pending {kind} {} has a different intent",
-                    existing.id
-                );
+                bail!("pending {kind} {} has a different intent", existing.id);
             }
             return Ok((existing.id, false));
         }
@@ -1115,7 +1137,10 @@ impl Store {
             return Ok(());
         };
         let text = std::fs::read_to_string(Path::new(directory).join("PROJECT.md")).ok();
-        if text.as_deref().is_some_and(|text| crate::project::parse_project_md(text).is_ok()) {
+        if text
+            .as_deref()
+            .is_some_and(|text| crate::project::parse_project_md(text).is_ok())
+        {
             self.finish_operation(&operation.id, "done", "")?;
         }
         Ok(())
@@ -1169,6 +1194,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_event(
         &self,
         project_id: &str,
@@ -1652,9 +1678,7 @@ mod tests {
         let remote_session = store.bind_session(&b.id, &other, true).unwrap();
         assert_ne!(local.id, remote_session.id);
         assert!(store.primary_session(&a.id).unwrap().unwrap().id == local.id);
-        assert!(
-            store.primary_session(&b.id).unwrap().unwrap().id == remote_session.id
-        );
+        assert!(store.primary_session(&b.id).unwrap().unwrap().id == remote_session.id);
     }
 
     #[test]
@@ -1723,7 +1747,12 @@ mod tests {
             .unwrap();
         assert_eq!(projects, 1);
         assert_eq!(imports, 1);
-        assert_eq!(store.former_slugs(&store.project_by_slug("demo").unwrap().unwrap().id).unwrap(), ["old"]);
+        assert_eq!(
+            store
+                .former_slugs(&store.project_by_slug("demo").unwrap().unwrap().id)
+                .unwrap(),
+            ["old"]
+        );
         let (check, fk) = store.integrity().unwrap();
         assert_eq!(check, "ok");
         assert!(fk.is_empty(), "{fk:?}");
@@ -1743,7 +1772,9 @@ mod tests {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let text = std::fs::read_to_string(&path).unwrap();
             let text = text.split("\nmod tests").next().unwrap_or(&text);
-            if text.contains("rusqlite") || text.contains("query_row") || text.contains("execute_batch")
+            if text.contains("rusqlite")
+                || text.contains("query_row")
+                || text.contains("execute_batch")
             {
                 sql.push(name.clone());
             }

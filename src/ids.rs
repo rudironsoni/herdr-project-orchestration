@@ -13,6 +13,7 @@ macro_rules! id_type {
                 Self(format!("{}_{}", $prefix, ulid::Ulid::generate()))
             }
 
+            #[allow(dead_code)]
             pub fn parse(text: &str) -> Result<Self> {
                 let rest = text.strip_prefix(concat!($prefix, "_")).unwrap_or("");
                 if rest.len() != 26 || !rest.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -21,6 +22,7 @@ macro_rules! id_type {
                 Ok(Self(text.to_string()))
             }
 
+            #[allow(dead_code)]
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -48,14 +50,17 @@ pub const ENV_LOCAL: &str = "env_local";
 id_type!(EnvironmentId, "env");
 
 impl EnvironmentId {
+    #[allow(dead_code)]
     pub fn local() -> Self {
         Self(ENV_LOCAL.to_string())
     }
 
+    #[allow(dead_code)]
     pub fn is_local(&self) -> bool {
         self.0 == ENV_LOCAL
     }
 
+    #[allow(dead_code)]
     pub fn from_db(text: &str) -> Result<Self> {
         if text == ENV_LOCAL {
             return Ok(Self::local());
