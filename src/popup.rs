@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, execute, queue, terminal};
 
@@ -404,15 +407,31 @@ fn header(text: impl Into<String>) -> Row {
     }
 }
 
+fn pr_number(thread: &Thread) -> Option<&str> {
+    let number = thread.pr.rsplit('/').next()?;
+    (!thread.pr.is_empty() && !number.is_empty()).then_some(number)
+}
+
 fn thread_line(r: &ThreadRow, with_project: bool) -> String {
     let t = &r.thread;
-    let mut parts = vec![format!("{}  {}", t.id, t.title)];
-    let state = if t.state_line.is_empty() {
-        crate::sidebar::word(r.group).to_string()
-    } else {
-        t.state_line.clone()
-    };
-    parts.push(state);
+    let mut parts = vec![t.id.clone(), crate::sidebar::word(r.group).to_string()];
+    if t.status == thread::Status::Failed {
+        parts.push("failed".into());
+    } else if t.last_state == "blocked" {
+        parts.push("blocked".into());
+    }
+    if let Some(number) = pr_number(t) {
+        parts.push(format!("PR #{number}"));
+    }
+    if !r.next.is_empty() {
+        parts.push(format!("next: {}", r.next.len()));
+    }
+    if !t.title.is_empty() {
+        parts.push(t.title.clone());
+    }
+    if !t.state_line.is_empty() {
+        parts.push(t.state_line.clone());
+    }
     if !t.activity.is_empty() && r.group != Group::Resolved {
         parts.push(t.activity.clone());
     }
@@ -425,14 +444,19 @@ fn thread_line(r: &ThreadRow, with_project: bool) -> String {
     if !t.agent.is_empty() {
         parts.push(t.agent.clone());
     }
-    if !r.next.is_empty() {
-        parts.push(format!("next: {}", r.next.len()));
-    }
     let line = parts.join(" · ");
     if with_project {
         format!("{} · {line}", r.slug)
     } else {
         line
+    }
+}
+
+fn coordinator_availability(project: &Project) -> String {
+    if crate::coordinator::reachable_coordinator(project).is_some() {
+        "coordinator available".into()
+    } else {
+        "coordinator unavailable".into()
     }
 }
 
@@ -470,7 +494,10 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
                         });
                     }
                 }
-            } else {
+            } else if let Some(slug) = scope {
+                if let Ok(project) = Project::load(root, slug) {
+                    rows.push(header(coordinator_availability(&project)));
+                }
                 for group in Group::DISPLAY_ORDER {
                     let mine: Vec<&ThreadRow> =
                         threads.iter().filter(|r| r.group == group).collect();
@@ -984,10 +1011,20 @@ impl<'a> Popup<'a> {
     }
 
     fn reload(&mut self) {
+        let keep = self.rows.get(self.selected).and_then(row_identity);
         self.rows = build(self.ctx, SECTIONS[self.section], self.scope.as_deref());
         if SECTIONS[self.section] == Section::Settings {
             self.rows
                 .extend(safety_rows(self.ctx, self.scope.as_deref()));
+        }
+        if let Some(keep) = keep
+            && let Some(index) = self
+                .rows
+                .iter()
+                .position(|row| row_identity(row).as_ref() == Some(&keep))
+        {
+            self.selected = index;
+            return;
         }
         if self.rows.get(self.selected).is_none_or(|r| r.header) {
             self.selected = self
@@ -1000,6 +1037,12 @@ impl<'a> Popup<'a> {
                 self.selected = self.rows.iter().position(|r| !r.header).unwrap_or(0);
             }
         }
+    }
+
+    fn set_section(&mut self, index: usize) {
+        self.section = index % SECTIONS.len();
+        self.selected = 0;
+        self.reload();
     }
 
     fn current(&self) -> Option<&Row> {
@@ -1022,6 +1065,85 @@ impl<'a> Popup<'a> {
                 break;
             }
         }
+    }
+
+    fn mouse(&mut self, event: MouseEvent) {
+        if !matches!(self.mode, Mode::List) {
+            return;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.list_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            }
+            MouseEventKind::ScrollDown => {
+                self.list_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.click(event.column as usize, event.row as usize);
+            }
+            _ => {}
+        }
+    }
+
+    fn click(&mut self, column: usize, row: usize) {
+        let (width, height) = screen_size();
+        if row == 0 {
+            let (_, spans) = self.header_tabs();
+            for (index, (start, end)) in spans.iter().enumerate() {
+                if column >= *start && column < *end && column < width {
+                    self.set_section(index);
+                    return;
+                }
+            }
+            return;
+        }
+        let (body_top, body_height) = body_window(height);
+        if row < body_top || row >= body_top + body_height {
+            return;
+        }
+        let index = self.list_start(body_height) + (row - body_top);
+        if self.rows.get(index).is_none_or(|target| target.header) {
+            return;
+        }
+        if index != self.selected {
+            self.selected = index;
+            return;
+        }
+        self.list_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    fn header_tabs(&self) -> (String, Vec<(usize, usize)>) {
+        let scope = match &self.scope {
+            Some(slug) => slug.clone(),
+            None => "all projects".into(),
+        };
+        let prefix = format!(" Projects · {scope}   ");
+        let mut column = prefix.chars().count();
+        let mut tabs = String::new();
+        let mut spans = Vec::new();
+        for (index, section) in SECTIONS.iter().enumerate() {
+            if index > 0 {
+                let separator = " · ";
+                tabs.push_str(separator);
+                column += separator.chars().count();
+            }
+            let label = if index == self.section {
+                format!("[{}]", section.name())
+            } else {
+                section.name().to_string()
+            };
+            let len = label.chars().count();
+            spans.push((column, column + len));
+            tabs.push_str(&label);
+            column += len;
+        }
+        (format!("{prefix}{tabs}"), spans)
+    }
+
+    fn list_start(&self, body_height: usize) -> usize {
+        self.selected
+            .saturating_sub(body_height.saturating_sub(1) / 2)
+            .min(self.rows.len().saturating_sub(body_height))
     }
 
     /// Runs this binary with `args` and keeps its last line as the message.
@@ -1641,15 +1763,9 @@ impl<'a> Popup<'a> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
-            KeyCode::Tab | KeyCode::Right => {
-                self.section = (self.section + 1) % SECTIONS.len();
-                self.selected = 0;
-                self.reload();
-            }
+            KeyCode::Tab | KeyCode::Right => self.set_section(self.section + 1),
             KeyCode::BackTab | KeyCode::Left => {
-                self.section = (self.section + SECTIONS.len() - 1) % SECTIONS.len();
-                self.selected = 0;
-                self.reload();
+                self.set_section(self.section + SECTIONS.len() - 1);
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
@@ -2169,30 +2285,13 @@ impl<'a> Popup<'a> {
     // ------------------------------------------------------------ drawing
 
     fn draw(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
-        let (width, height) = terminal::size().unwrap_or((100, 30));
-        let (width, height) = (width as usize, height as usize);
+        let (width, height) = screen_size();
         queue!(
             out,
             terminal::Clear(terminal::ClearType::All),
             cursor::MoveTo(0, 0)
         )?;
-        // Header: section tabs and a right-aligned summary.
-        let mut tabs = String::new();
-        for (i, section) in SECTIONS.iter().enumerate() {
-            if i > 0 {
-                tabs.push_str(" · ");
-            }
-            if i == self.section {
-                tabs.push_str(&format!("[{}]", section.name()));
-            } else {
-                tabs.push_str(section.name());
-            }
-        }
-        let scope = match &self.scope {
-            Some(slug) => slug.clone(),
-            None => "all projects".into(),
-        };
-        let left = format!(" Projects · {scope}   {tabs}");
+        let (left, _) = self.header_tabs();
         let right = summary(&self.ctx.root);
         let pad = width.saturating_sub(left.chars().count() + right.chars().count() + 1);
         let left_text: String = left.chars().take(width).collect();
@@ -2213,8 +2312,7 @@ impl<'a> Popup<'a> {
         }
         queue!(out, cursor::MoveTo(0, 1), Print("─".repeat(width)))?;
 
-        let body_top = 2;
-        let body_height = height.saturating_sub(4);
+        let (body_top, body_height) = body_window(height);
         match &self.mode {
             Mode::Detail {
                 title,
@@ -2472,18 +2570,10 @@ impl<'a> Popup<'a> {
                 }
             }
             _ => {
-                let start = self
-                    .selected
-                    .saturating_sub(body_height.saturating_sub(1) / 2)
-                    .min(self.rows.len().saturating_sub(body_height));
+                let start = self.list_start(body_height);
                 for (i, row) in self.rows.iter().enumerate().skip(start).take(body_height) {
                     queue!(out, cursor::MoveTo(0, (body_top + i - start) as u16))?;
-                    let marker = if i == self.selected && !row.header {
-                        "▌"
-                    } else {
-                        " "
-                    };
-                    let text = fit(&format!("{marker}{}", row.text), width);
+                    let text = paint_list_row(row, i == self.selected, width);
                     if row.header {
                         queue!(
                             out,
@@ -2615,6 +2705,27 @@ fn detail(root: &Path, row: &ThreadRow) -> Mode {
     }
 }
 
+fn row_identity(row: &Row) -> Option<String> {
+    match &row.kind {
+        RowKind::Thread(thread) => Some(format!("{}:{}", thread.slug, thread.thread.id)),
+        _ => None,
+    }
+}
+
+fn screen_size() -> (usize, usize) {
+    let (width, height) = terminal::size().unwrap_or((100, 30));
+    (width as usize, height as usize)
+}
+
+fn body_window(height: usize) -> (usize, usize) {
+    (2, height.saturating_sub(4))
+}
+
+fn paint_list_row(row: &Row, selected: bool, width: usize) -> String {
+    let marker = if selected && !row.header { "▌" } else { " " };
+    fit(&format!("{marker}{}", row.text), width)
+}
+
 fn fit(text: &str, width: usize) -> String {
     let count = text.chars().count();
     if count <= width {
@@ -2738,7 +2849,12 @@ pub fn run(ctx: &Ctx, scope: Option<String>, workspace: String) -> Result<()> {
     let mut popup = Popup::new(ctx, scope, workspace);
     let mut out = std::io::stdout();
     terminal::enable_raw_mode()?;
-    execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
+        cursor::Hide,
+        EnableMouseCapture
+    )?;
     let result = (|| -> Result<()> {
         let mut last = Instant::now();
         popup.draw(&mut out)?;
@@ -2746,6 +2862,7 @@ pub fn run(ctx: &Ctx, scope: Option<String>, workspace: String) -> Result<()> {
             if event::poll(Duration::from_millis(250))? {
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => popup.key(key),
+                    Event::Mouse(mouse) => popup.mouse(mouse),
                     Event::Resize(..) => {}
                     _ => continue,
                 }
@@ -2759,7 +2876,12 @@ pub fn run(ctx: &Ctx, scope: Option<String>, workspace: String) -> Result<()> {
         }
         Ok(())
     })();
-    let _ = execute!(out, cursor::Show, terminal::LeaveAlternateScreen);
+    let _ = execute!(
+        out,
+        DisableMouseCapture,
+        cursor::Show,
+        terminal::LeaveAlternateScreen
+    );
     let _ = terminal::disable_raw_mode();
     if let Some((socket, machine, pane)) = popup.jump.take() {
         focus(ctx, &socket, &machine, &pane);
@@ -2847,13 +2969,16 @@ mod tests {
         .unwrap();
         let rows = build(&world.ctx(), Section::Threads, Some("demo"));
         let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
-        assert_eq!(texts[0], "Waiting on you (1)");
+        assert_eq!(texts[0], "coordinator available");
+        assert_eq!(texts[1], "Waiting on you (1)");
         assert!(
-            texts[1].contains("t-0002  Second") && texts[1].contains("next: 1"),
+            texts[2].contains("t-0002")
+                && texts[2].contains("Second")
+                && texts[2].contains("next: 1"),
             "{texts:?}"
         );
-        assert_eq!(texts[2], "Working (1)");
-        assert!(texts[3].contains("working · ~40%"));
+        assert_eq!(texts[3], "Working (1)");
+        assert!(texts[4].contains("working · ~40%"));
         let all = build(&world.ctx(), Section::Threads, None);
         assert!(
             all[0].text.starts_with("demo · 1 need you · 1 working"),
@@ -3218,5 +3343,228 @@ mod tests {
         assert_eq!(slugs, [None, Some("demo")]);
         assert_eq!(rows[0].status, "1 project · 1 need you");
         assert_eq!(rows[1].status, "1 need you");
+    }
+
+    fn down(column: usize, row: usize) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column as u16,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn row_y(popup: &Popup, index: usize) -> usize {
+        let (_, height) = screen_size();
+        let (body_top, body_height) = body_window(height);
+        body_top + index - popup.list_start(body_height)
+    }
+
+    fn selected_thread(popup: &Popup) -> Option<String> {
+        match popup.current().map(|row| &row.kind) {
+            Some(RowKind::Thread(thread)) => Some(thread.thread.id.clone()),
+            _ => None,
+        }
+    }
+
+    fn two_threads(world: &crate::scenarios::World, project: &Project) -> (String, String) {
+        let first = world.thread(project, world.home.path(), |thread| {
+            thread.title = "First".into();
+            thread.last_group = "waiting-on-you".into();
+            thread.pane_id = "w2:p1".into();
+        });
+        let second = thread::allocate(project, |thread| {
+            thread.title = "Second".into();
+            thread.status = thread::Status::Open;
+            thread.last_group = "working".into();
+            thread.pane_id = "w2:p2".into();
+        })
+        .unwrap();
+        (first.id, second.id)
+    }
+
+    #[test]
+    fn popup_mouse_section_click_switches_section_and_keys_still_move() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        two_threads(&world, &project);
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        let tasks = SECTIONS
+            .iter()
+            .position(|section| *section == Section::Tasks)
+            .unwrap();
+        let (start, _) = popup.header_tabs().1[tasks];
+        popup.mouse(down(start, 0));
+        assert_eq!(SECTIONS[popup.section], Section::Tasks);
+        popup.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(SECTIONS[popup.section], Section::Threads);
+        let before = popup.selected;
+        popup.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_ne!(popup.selected, before);
+    }
+
+    #[test]
+    fn popup_mouse_row_click_selects_and_activation_matches_enter() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let (_, second) = two_threads(&world, &project);
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        let index = popup
+            .rows
+            .iter()
+            .position(
+                |row| matches!(&row.kind, RowKind::Thread(thread) if thread.thread.id == second),
+            )
+            .unwrap();
+        assert_ne!(popup.selected, index);
+        popup.mouse(down(1, row_y(&popup, index)));
+        assert_eq!(popup.selected, index);
+        assert!(!popup.quit);
+        assert!(popup.jump.is_none());
+        let mut keys = Popup::new(&ctx, Some("demo".into()), String::new());
+        keys.selected = index;
+        keys.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        popup.mouse(down(1, row_y(&popup, index)));
+        assert_eq!(popup.jump, keys.jump);
+        assert_eq!(popup.quit, keys.quit);
+        assert!(popup.quit);
+    }
+
+    #[test]
+    fn popup_mouse_wheel_moves_like_up_and_down() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        two_threads(&world, &project);
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        let start = popup.selected;
+        popup.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        let wheeled = popup.selected;
+        popup.selected = start;
+        popup.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(popup.selected, wheeled);
+        assert_ne!(start, wheeled);
+        popup.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(popup.selected, start);
+    }
+
+    #[test]
+    fn popup_mouse_heading_click_does_not_select_or_act() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        two_threads(&world, &project);
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        let header = popup.rows.iter().position(|row| row.header).unwrap();
+        let selected = popup.selected;
+        popup.mouse(down(0, row_y(&popup, header)));
+        assert_eq!(popup.selected, selected);
+        assert!(!popup.quit);
+        assert!(popup.jump.is_none());
+        assert!(matches!(popup.mode, Mode::List));
+    }
+
+    #[test]
+    fn popup_mouse_reload_keeps_the_selected_thread() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let (_, second) = two_threads(&world, &project);
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        popup.selected = popup
+            .rows
+            .iter()
+            .position(
+                |row| matches!(&row.kind, RowKind::Thread(thread) if thread.thread.id == second),
+            )
+            .unwrap();
+        thread::allocate(&project, |thread| {
+            thread.title = "Earlier".into();
+            thread.status = thread::Status::Open;
+            thread.last_group = "waiting-on-you".into();
+            thread.pane_id = "w2:p3".into();
+        })
+        .unwrap();
+        popup.reload();
+        assert_eq!(selected_thread(&popup).as_deref(), Some(second.as_str()));
+    }
+
+    #[test]
+    fn popup_state_thread_line_keeps_id_state_pr_and_next_at_80_columns() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let thread = world.thread(&project, world.home.path(), |thread| {
+            thread.title = "T".repeat(200);
+            thread.last_group = "waiting-on-you".into();
+            thread.last_state = "blocked".into();
+            thread.pr = "https://github.com/o/r/pull/17".into();
+            thread.status = thread::Status::Open;
+        });
+        std::fs::write(
+            thread::extra_next_path(&project, &thread.id),
+            "- one\n- two\n",
+        )
+        .unwrap();
+        let rows = build(&world.ctx(), Section::Threads, Some("demo"));
+        let row = rows
+            .iter()
+            .find(|row| {
+                matches!(&row.kind, RowKind::Thread(found) if found.thread.id == thread.id)
+            })
+            .unwrap();
+        let painted = paint_list_row(row, true, 80);
+        assert!(painted.chars().count() <= 80, "{painted}");
+        assert!(painted.contains(&thread.id), "{painted}");
+        assert!(painted.contains("needs you"), "{painted}");
+        assert!(painted.contains("blocked"), "{painted}");
+        assert!(painted.contains("PR #17"), "{painted}");
+        assert!(painted.contains("next: 2"), "{painted}");
+        assert!(!painted.contains(&"T".repeat(200)), "{painted}");
+    }
+
+    #[test]
+    fn popup_state_gone_primary_is_unavailable_and_not_another_agent() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        project
+            .update_coordinator(|coordinator| {
+                coordinator.socket = world
+                    .home
+                    .path()
+                    .join("missing-primary.sock")
+                    .display()
+                    .to_string();
+                coordinator.pane_id = "w1:p1".into();
+            })
+            .unwrap();
+        crate::coordinator::save_live(
+            &project,
+            &[crate::coordinator::LivePane {
+                name: "other-lead".into(),
+                pane_id: "w9:p9".into(),
+                ..crate::coordinator::LivePane::default()
+            }],
+        )
+        .unwrap();
+        let rows = build(&world.ctx(), Section::Threads, Some("demo"));
+        let text = rows
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("unavailable"), "{text}");
+        assert!(!text.contains("other-lead"), "{text}");
     }
 }
