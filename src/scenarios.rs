@@ -4817,7 +4817,7 @@ fn open_records_intent_before_a_workspace_and_a_retry_does_not_create_another() 
             let store = crate::store::Store::open(&root).unwrap();
             let row = store.project_by_slug("demo").unwrap().unwrap();
             assert!(store.pending_kind(&row.id, "open_coordinator").unwrap().is_some());
-            Ok(ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1"}}}"#))
+            Ok(ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1","terminal_id":"term_new"}}}"#))
         },
     );
     world.runner.on("tab rename", ok(r#"{"result":{}}"#));
@@ -4839,8 +4839,18 @@ fn open_records_intent_before_a_workspace_and_a_retry_does_not_create_another() 
     };
     coordinator::open(&world.ctx(), &project.slug, &options).unwrap();
     assert_eq!(world.runner.count("workspace create"), 1);
+    let (store, row) = project.open_row().unwrap();
+    assert_eq!(
+        store.primary_session(&row.id).unwrap().unwrap().terminal_id,
+        "term_new"
+    );
     coordinator::open(&world.ctx(), &project.slug, &options).unwrap();
     assert_eq!(world.runner.count("workspace create"), 1);
+    let (store, row) = project.open_row().unwrap();
+    assert_eq!(
+        store.primary_session(&row.id).unwrap().unwrap().terminal_id,
+        "term_new"
+    );
     assert_eq!(
         project.project_id().unwrap(),
         Project::load(&world.root, "demo")

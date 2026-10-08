@@ -255,6 +255,7 @@ pub struct Created {
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
+    pub terminal_id: String,
 }
 
 impl<'a> Herdr<'a> {
@@ -350,6 +351,7 @@ impl<'a> Herdr<'a> {
                 workspace_id: w.into(),
                 tab_id: t.into(),
                 pane_id: p.into(),
+                terminal_id: pane["terminal_id"].as_str().unwrap_or("").into(),
             }),
             _ => Err(HerdrError {
                 code: "failed".into(),

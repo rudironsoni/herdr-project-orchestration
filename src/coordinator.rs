@@ -393,13 +393,17 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             && panes.iter().any(|p| pane_matches(record, p))
             && !agents.iter().any(|a| a.pane_id == record.pane_id)
     });
-    let (workspace_id, tab_id, pane_id) = if let Some(record) = previous.as_ref().filter(|record| {
-        record.agent_name == name && !record.workspace_id.is_empty() && !record.pane_id.is_empty()
-    }) {
+    let (workspace_id, tab_id, pane_id, created_terminal) = if let Some(record) =
+        previous.as_ref().filter(|record| {
+            record.agent_name == name
+                && !record.workspace_id.is_empty()
+                && !record.pane_id.is_empty()
+        }) {
         (
             record.workspace_id.clone(),
             record.tab_id.clone(),
             record.pane_id.clone(),
+            String::new(),
         )
     } else if let Some(pane) = &here {
         let pane = panes.iter().find(|p| &p.pane_id == pane).with_context(|| {
@@ -409,6 +413,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             pane.workspace_id.clone(),
             pane.tab_id.clone(),
             pane.pane_id.clone(),
+            String::new(),
         )
     } else if let Some(record) = reusable {
         sync_label(&herdr, &record.workspace_id, &label);
@@ -416,6 +421,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             record.workspace_id.clone(),
             record.tab_id.clone(),
             record.pane_id.clone(),
+            String::new(),
         )
     } else {
         let workspace = previous
@@ -440,7 +446,28 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 created
             }
         };
-        (created.workspace_id, created.tab_id, created.pane_id)
+        (
+            created.workspace_id,
+            created.tab_id,
+            created.pane_id,
+            created.terminal_id,
+        )
+    };
+    let from_list = panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .map(|pane| pane.terminal_id.clone())
+        .unwrap_or_default();
+    let terminal_id = if !from_list.is_empty() {
+        from_list
+    } else if !created_terminal.is_empty() {
+        created_terminal
+    } else {
+        previous
+            .as_ref()
+            .filter(|record| record.pane_id == pane_id)
+            .map(|record| record.terminal_id.clone())
+            .unwrap_or_default()
     };
     let named: Vec<_> = agents.iter().filter(|agent| agent.name == name).collect();
     if named.len() > 1 {
@@ -496,11 +523,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             workspace_id,
             tab_id,
             pane_id: pane_id.clone(),
-            terminal_id: panes
-                .iter()
-                .find(|pane| pane.pane_id == pane_id)
-                .map(|pane| pane.terminal_id.clone())
-                .unwrap_or_default(),
+            terminal_id,
             agent_name: name.clone(),
             cwd: cwd.clone(),
             agent: kind.clone(),
