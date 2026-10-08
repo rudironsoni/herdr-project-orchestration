@@ -1067,10 +1067,12 @@ impl<'a> Popup<'a> {
         }
     }
 
-    fn mouse(&mut self, event: MouseEvent) {
+    /// `true` when the event changed what is on screen. A move does not.
+    fn mouse(&mut self, event: MouseEvent) -> bool {
         if !matches!(self.mode, Mode::List) {
-            return;
+            return false;
         }
+        let before = self.list_view();
         match event.kind {
             MouseEventKind::ScrollUp => {
                 self.list_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
@@ -1081,8 +1083,51 @@ impl<'a> Popup<'a> {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.click(event.column as usize, event.row as usize);
             }
-            _ => {}
+            _ => return false,
         }
+        self.list_view() != before
+    }
+
+    fn list_view(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        &'static str,
+        String,
+        String,
+        Vec<(bool, String)>,
+    ) {
+        (
+            self.section,
+            self.selected,
+            self.mode_tag(),
+            self.message.clone(),
+            summary(&self.ctx.root),
+            self.rows
+                .iter()
+                .map(|row| (row.header, row.text.clone()))
+                .collect(),
+        )
+    }
+
+    fn mode_tag(&self) -> &'static str {
+        match self.mode {
+            Mode::List => "list",
+            Mode::Detail { .. } => "detail",
+            Mode::Confirm { .. } => "confirm",
+            Mode::Edit { .. } => "edit",
+            Mode::Pick { .. } => "pick",
+            Mode::Toggle { .. } => "toggle",
+            Mode::Form { .. } => "form",
+            Mode::Projects(_) => "projects",
+        }
+    }
+
+    fn refresh_list(&mut self) -> bool {
+        let before = self.list_view();
+        self.reload();
+        self.list_view() != before
     }
 
     fn click(&mut self, column: usize, row: usize) {
@@ -2855,22 +2900,31 @@ pub fn run(ctx: &Ctx, scope: Option<String>, workspace: String) -> Result<()> {
         cursor::Hide,
         EnableMouseCapture
     )?;
+    // Clicks and the wheel only. Any-event tracking repaints on every move.
+    let _ = out.write_all(b"\x1b[?1002l\x1b[?1003l");
+    let _ = out.flush();
     let result = (|| -> Result<()> {
         let mut last = Instant::now();
         popup.draw(&mut out)?;
         while !popup.quit {
             if event::poll(Duration::from_millis(250))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => popup.key(key),
+                let draw = match event::read()? {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        popup.key(key);
+                        true
+                    }
                     Event::Mouse(mouse) => popup.mouse(mouse),
-                    Event::Resize(..) => {}
-                    _ => continue,
+                    Event::Resize(..) => true,
+                    _ => false,
+                };
+                if draw {
+                    popup.draw(&mut out)?;
                 }
-                popup.draw(&mut out)?;
             }
             if last.elapsed() >= REFRESH && matches!(popup.mode, Mode::List) {
-                popup.reload();
-                popup.draw(&mut out)?;
+                if popup.refresh_list() {
+                    popup.draw(&mut out)?;
+                }
                 last = Instant::now();
             }
         }
@@ -3461,6 +3515,25 @@ mod tests {
     }
 
     #[test]
+    fn popup_mouse_move_does_not_repaint() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        two_threads(&world, &project);
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        let selected = popup.selected;
+        let changed = popup.mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!changed);
+        assert_eq!(popup.selected, selected);
+        assert!(!popup.quit);
+    }
+
+    #[test]
     fn popup_mouse_heading_click_does_not_select_or_act() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
@@ -3520,9 +3593,7 @@ mod tests {
         let rows = build(&world.ctx(), Section::Threads, Some("demo"));
         let row = rows
             .iter()
-            .find(|row| {
-                matches!(&row.kind, RowKind::Thread(found) if found.thread.id == thread.id)
-            })
+            .find(|row| matches!(&row.kind, RowKind::Thread(found) if found.thread.id == thread.id))
             .unwrap();
         let painted = paint_list_row(row, true, 80);
         assert!(painted.chars().count() <= 80, "{painted}");
