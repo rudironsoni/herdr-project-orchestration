@@ -376,6 +376,19 @@ pub struct RepoRow {
     pub removed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceRow {
+    pub id: String,
+    pub repository_id: Option<String>,
+    pub cwd: String,
+    pub branch: String,
+    pub ownership: String,
+    pub availability: String,
+    pub environment_id: String,
+    pub environment_state: String,
+    pub environment_label: String,
+}
+
 fn now() -> String {
     jiff::Timestamp::now()
         .round(jiff::Unit::Second)
@@ -949,6 +962,30 @@ impl Store {
                 machine_label: row.get(2)?,
                 environment_id: row.get(3)?,
                 removed: row.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_workspaces(&self, project_id: &str) -> Result<Vec<WorkspaceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.id, w.repository_id, w.cwd, w.branch, w.ownership, w.availability, w.environment_id, e.state, e.label
+             FROM workspaces w
+             JOIN environments e ON e.id = w.environment_id
+             WHERE w.project_id = ?1 AND w.archived_at IS NULL
+             ORDER BY w.cwd, w.id",
+        )?;
+        let rows = stmt.query_map([project_id], |row| {
+            Ok(WorkspaceRow {
+                id: row.get(0)?,
+                repository_id: row.get(1)?,
+                cwd: row.get(2)?,
+                branch: row.get(3)?,
+                ownership: row.get(4)?,
+                availability: row.get(5)?,
+                environment_id: row.get(6)?,
+                environment_state: row.get(7)?,
+                environment_label: row.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

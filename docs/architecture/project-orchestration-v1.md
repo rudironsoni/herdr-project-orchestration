@@ -91,7 +91,17 @@ Milestone 3 moves harness flag tables behind one adapter. The coordinator still 
 
 ## 10. TUI
 
-Milestone 1 does not change the popup. Milestone 5 adds the project list and dashboard. Ratatui is for that surface, not for this milestone.
+`prefix+a` opens one full screen. The action id is `herdr-projects.open-popup`. `P` and `/` open the project picker.
+
+The screen opens on Overview. `g` then `1` through `9` selects Overview, Needs you, Work, Places, Reviews, Tasks, Inbox, Automation, and More. `1` through `9` on a thread row still run Next.
+
+Needs you lists threads whose group is Waiting on you, except a failed thread. A failed thread is a Work row and its word is failed. Reviews lists Ready for review and Landing. A pull request is a string on the thread. Inbox rows and task lines are not copied into Needs you.
+
+Places reads repository rows and workspace rows. A workspace with `repository_id` set is under that repository. A workspace with `repository_id` null is under the heading Project directory. A thread is not a Places row.
+
+Archive is `A` on Settings. Settings and Memory are under More. Esc goes back one level and closes the screen at the root. `\` hides the project list when the width is at least 120. Below 120 columns the screen is one pane and the breadcrumb is first. `l` shows the inspector in place of the list, and Esc returns to the list. At 120 and above, the project list, the body, and the inspector are visible. At 160 the Places body can split repository and workspace. The inspector shows the selected row. It does not show the agent transcript.
+
+`t` on Work runs `thread start` for worktree, tab, or checkout, and `thread adopt` for adopted.
 
 ## 11. Configuration
 
