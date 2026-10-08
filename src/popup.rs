@@ -594,11 +594,7 @@ fn place_row(
     Row {
         header: false,
         text,
-        color: if unresolved {
-            Some(Color::Red)
-        } else {
-            None
-        },
+        color: if unresolved { Some(Color::Red) } else { None },
         kind: RowKind::Place {
             slug: project.slug.clone(),
             cwd: cwd.to_string(),
@@ -612,12 +608,14 @@ fn place_row(
 }
 
 fn places_for(rows: &mut Vec<Row>, project: &Project) {
-    let loaded = crate::store::Store::open(&project.root).ok().and_then(|store| {
-        let row = store.project_by_slug(&project.slug).ok()??;
-        let repos = store.repos(&row.id).ok()?;
-        let workspaces = store.list_workspaces(&row.id).ok()?;
-        Some((repos, workspaces))
-    });
+    let loaded = crate::store::Store::open(&project.root)
+        .ok()
+        .and_then(|store| {
+            let row = store.project_by_slug(&project.slug).ok()??;
+            let repos = store.repos(&row.id).ok()?;
+            let workspaces = store.list_workspaces(&row.id).ok()?;
+            Some((repos, workspaces))
+        });
     if let Some((repos, workspaces)) = loaded
         && (!repos.is_empty() || !workspaces.is_empty())
     {
@@ -1377,7 +1375,10 @@ impl<'a> Popup<'a> {
         Vec<(bool, String)>,
     ) {
         (
-            VIEWS.iter().position(|view| *view == self.view).unwrap_or(9),
+            VIEWS
+                .iter()
+                .position(|view| *view == self.view)
+                .unwrap_or(9),
             self.selected,
             self.mode_tag(),
             self.message.clone(),
@@ -1964,7 +1965,16 @@ impl<'a> Popup<'a> {
                         selected,
                     }
                 }
-                KeyCode::Enter => self.start_advance(slug, phase, kind, title, repo, buffer, options, selected),
+                KeyCode::Enter => self.start_advance(Mode::Start {
+                    slug,
+                    phase,
+                    kind,
+                    title,
+                    repo,
+                    buffer,
+                    options,
+                    selected,
+                }),
                 _ => Mode::Start {
                     slug,
                     phase,
@@ -1979,22 +1989,34 @@ impl<'a> Popup<'a> {
         };
     }
 
-    fn start_advance(
-        &mut self,
-        slug: String,
-        phase: StartPhase,
-        kind: String,
-        title: String,
-        repo: String,
-        buffer: String,
-        options: Vec<String>,
-        selected: usize,
-    ) -> Mode {
+    fn start_advance(&mut self, mode: Mode) -> Mode {
+        let Mode::Start {
+            slug,
+            phase,
+            kind,
+            title,
+            repo,
+            buffer,
+            options,
+            selected,
+        } = mode
+        else {
+            return mode;
+        };
         match phase {
             StartPhase::Kind => {
                 let kind = options[selected].clone();
                 if kind == "tab" || kind == "adopted" {
-                    return start_mode(slug, StartPhase::Title, kind, title, repo, String::new(), Vec::new(), 0);
+                    return Mode::Start {
+                        slug,
+                        phase: StartPhase::Title,
+                        kind,
+                        title,
+                        repo,
+                        buffer: String::new(),
+                        options: Vec::new(),
+                        selected: 0,
+                    };
                 }
                 let repos = Project::load(&self.ctx.root, &slug)
                     .and_then(|project| project.read_project_md())
@@ -2005,55 +2027,82 @@ impl<'a> Popup<'a> {
                     return Mode::List;
                 }
                 if repos.len() == 1 {
-                    return start_mode(
+                    return Mode::Start {
                         slug,
-                        StartPhase::Title,
+                        phase: StartPhase::Title,
                         kind,
                         title,
-                        repos[0].path.clone(),
-                        String::new(),
-                        Vec::new(),
-                        0,
-                    );
+                        repo: repos[0].path.clone(),
+                        buffer: String::new(),
+                        options: Vec::new(),
+                        selected: 0,
+                    };
                 }
-                start_mode(
+                Mode::Start {
                     slug,
-                    StartPhase::Repo,
+                    phase: StartPhase::Repo,
                     kind,
                     title,
-                    String::new(),
-                    String::new(),
-                    repos.into_iter().map(|repo| repo.path).collect(),
-                    0,
-                )
+                    repo: String::new(),
+                    buffer: String::new(),
+                    options: repos.into_iter().map(|repo| repo.path).collect(),
+                    selected: 0,
+                }
             }
-            StartPhase::Repo => start_mode(
+            StartPhase::Repo => Mode::Start {
                 slug,
-                StartPhase::Title,
+                phase: StartPhase::Title,
                 kind,
                 title,
-                options[selected].clone(),
-                String::new(),
-                Vec::new(),
-                0,
-            ),
+                repo: options[selected].clone(),
+                buffer: String::new(),
+                options: Vec::new(),
+                selected: 0,
+            },
             StartPhase::Title => {
                 let next_title = buffer.trim().to_string();
                 if next_title.is_empty() {
                     self.message = "--title may not be empty".into();
-                    return start_mode(slug, phase, kind, String::new(), repo, buffer, options, selected);
+                    return Mode::Start {
+                        slug,
+                        phase,
+                        kind,
+                        title: String::new(),
+                        repo,
+                        buffer,
+                        options,
+                        selected,
+                    };
                 }
                 let next = if kind == "adopted" {
                     StartPhase::Pane
                 } else {
                     StartPhase::Task
                 };
-                start_mode(slug, next, kind, next_title, repo, String::new(), Vec::new(), 0)
+                Mode::Start {
+                    slug,
+                    phase: next,
+                    kind,
+                    title: next_title,
+                    repo,
+                    buffer: String::new(),
+                    options: Vec::new(),
+                    selected: 0,
+                }
             }
             StartPhase::Task => {
                 if buffer.trim().is_empty() {
                     self.message = "the task is empty".into();
-                    return start_mode(slug, phase, kind, title, repo, buffer, options, selected);
+                    return Mode::Start {
+                        slug,
+                        phase,
+                        kind,
+                        title,
+                        repo,
+                        buffer,
+                        options,
+                        selected,
+                    };
                 }
                 let mut args = vec![
                     "thread".into(),
@@ -2076,7 +2125,16 @@ impl<'a> Popup<'a> {
                 let pane = buffer.trim().to_string();
                 if pane.is_empty() {
                     self.message = "--pane may not be empty".into();
-                    return start_mode(slug, phase, kind, title, repo, buffer, options, selected);
+                    return Mode::Start {
+                        slug,
+                        phase,
+                        kind,
+                        title,
+                        repo,
+                        buffer,
+                        options,
+                        selected,
+                    };
                 }
                 self.run(
                     &[
@@ -2925,7 +2983,10 @@ impl<'a> Popup<'a> {
     ) -> std::io::Result<()> {
         let (project_w, body_w, inspector_w) = column_widths(width, self.hide_projects);
         if project_w > 0 {
-            for (i, project) in picker_rows(&self.ctx.root).iter().take(body_height).enumerate()
+            for (i, project) in picker_rows(&self.ctx.root)
+                .iter()
+                .take(body_height)
+                .enumerate()
             {
                 let name = match &project.slug {
                     Some(slug) if slug != &project.name => format!("{} ({slug})", project.name),
@@ -2974,10 +3035,7 @@ impl<'a> Popup<'a> {
                 })
                 .unwrap_or_default();
             for (i, index) in headers.iter().take(body_height).enumerate() {
-                queue!(
-                    out,
-                    cursor::MoveTo(project_w as u16, (body_top + i) as u16)
-                )?;
+                queue!(out, cursor::MoveTo(project_w as u16, (body_top + i) as u16))?;
                 self.paint_row(out, &self.rows[*index], Some(*index) == group, left)?;
             }
             for (i, index) in places.iter().take(body_height).enumerate() {
@@ -2985,12 +3043,7 @@ impl<'a> Popup<'a> {
                     out,
                     cursor::MoveTo((project_w + left) as u16, (body_top + i) as u16)
                 )?;
-                self.paint_row(
-                    out,
-                    &self.rows[*index],
-                    *index == self.selected,
-                    right,
-                )?;
+                self.paint_row(out, &self.rows[*index], *index == self.selected, right)?;
             }
         } else {
             let start = self.list_start(body_height);
@@ -3003,10 +3056,7 @@ impl<'a> Popup<'a> {
             }
         }
         if inspector_w > 0 {
-            let lines = self
-                .current()
-                .map(inspector_lines)
-                .unwrap_or_default();
+            let lines = self.current().map(inspector_lines).unwrap_or_default();
             let x = (project_w + body_w) as u16;
             for (i, line) in lines.iter().take(body_height).enumerate() {
                 queue!(
@@ -3389,9 +3439,7 @@ impl<'a> Popup<'a> {
                     "esc close"
                 }
             ),
-            Mode::Start { options, .. } if options.is_empty() => {
-                "type  ↵ next  esc cancel".into()
-            }
+            Mode::Start { options, .. } if options.is_empty() => "type  ↵ next  esc cancel".into(),
             Mode::Start { .. } => "↑↓ choose  ↵ next  esc cancel".into(),
             Mode::Projects(Picker {
                 filter: Some(_), ..
@@ -3496,38 +3544,12 @@ fn row_identity(row: &Row) -> Option<String> {
     }
 }
 
-fn start_mode(
-    slug: String,
-    phase: StartPhase,
-    kind: String,
-    title: String,
-    repo: String,
-    buffer: String,
-    options: Vec<String>,
-    selected: usize,
-) -> Mode {
-    Mode::Start {
-        slug,
-        phase,
-        kind,
-        title,
-        repo,
-        buffer,
-        options,
-        selected,
-    }
-}
-
 fn column_widths(width: usize, hide_projects: bool) -> (usize, usize, usize) {
     if width < 120 {
         return (0, width, 0);
     }
     let inspector = 32.min(width / 4);
-    let project = if hide_projects {
-        0
-    } else {
-        22.min(width / 5)
-    };
+    let project = if hide_projects { 0 } else { 22.min(width / 5) };
     let body = width.saturating_sub(project + inspector);
     (project, body, inspector)
 }
@@ -3552,8 +3574,12 @@ fn inspector_lines(row: &Row) -> Vec<String> {
             }
             lines
         }
-        RowKind::Coordinator { slug } => vec![format!("coordinator {slug}"), row.text.trim().into()],
-        RowKind::Place { cwd, unresolved, .. } => {
+        RowKind::Coordinator { slug } => {
+            vec![format!("coordinator {slug}"), row.text.trim().into()]
+        }
+        RowKind::Place {
+            cwd, unresolved, ..
+        } => {
             let mut lines = vec![cwd.clone()];
             if *unresolved {
                 lines.push("unresolved".into());
@@ -4755,17 +4781,24 @@ mod tests {
             .position(|text| *text == "Project directory")
             .unwrap();
         for path in ["/repo/a", "/repo/b", "/repo/c", "/repo/d"] {
-            let at = places_text.iter().position(|text| text.contains(path)).unwrap();
+            let at = places_text
+                .iter()
+                .position(|text| text.contains(path))
+                .unwrap();
             assert!(at < directory, "{path} {places_text:?}");
         }
-        assert!(places_text
-            .iter()
-            .skip(directory + 1)
-            .any(|text| text.contains(&dir)));
-        assert!(places_text
-            .iter()
-            .skip(directory + 1)
-            .any(|text| text.contains("/proj/loose")));
+        assert!(
+            places_text
+                .iter()
+                .skip(directory + 1)
+                .any(|text| text.contains(&dir))
+        );
+        assert!(
+            places_text
+                .iter()
+                .skip(directory + 1)
+                .any(|text| text.contains("/proj/loose"))
+        );
         assert_eq!(
             places_text
                 .iter()
@@ -4773,7 +4806,11 @@ mod tests {
                 .count(),
             2
         );
-        assert!(places.iter().all(|row| !matches!(row.kind, RowKind::Thread(_))));
+        assert!(
+            places
+                .iter()
+                .all(|row| !matches!(row.kind, RowKind::Thread(_)))
+        );
 
         let ctx = world.ctx();
         let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
