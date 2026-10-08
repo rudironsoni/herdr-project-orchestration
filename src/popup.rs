@@ -2,10 +2,12 @@
 //! dialog. Sections threads · tasks · inbox · routines · settings · memory;
 //! ↑↓ tab ↵ esc. It reads the files the ticker and the coordinator keep, and
 //! every key runs a CLI command of this binary, so the popup can do nothing
-//! the CLI cannot. It redraws every two seconds.
+//! the CLI cannot. It redraws on input, and when a list refresh changes the view.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread::spawn;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -2888,6 +2890,65 @@ fn focus(ctx: &Ctx, socket: &str, machine: &str, pane: &str) {
     let _ = command.spawn();
 }
 
+enum TermEvent {
+    Tick,
+    Key(KeyEvent),
+    Mouse(MouseEvent),
+    Resize,
+}
+
+struct Events {
+    rx: mpsc::Receiver<TermEvent>,
+}
+
+impl Events {
+    fn start(tick: Duration) -> Self {
+        let (tx, rx) = mpsc::channel();
+        spawn(move || {
+            let mut last = Instant::now();
+            loop {
+                let timeout = tick.saturating_sub(last.elapsed());
+                let sent = match event::poll(timeout) {
+                    Ok(true) => match event::read() {
+                        Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                            tx.send(TermEvent::Key(key))
+                        }
+                        Ok(Event::Mouse(mouse))
+                            if !matches!(
+                                mouse.kind,
+                                MouseEventKind::Moved | MouseEventKind::Drag(_)
+                            ) =>
+                        {
+                            tx.send(TermEvent::Mouse(mouse))
+                        }
+                        Ok(Event::Resize(..)) => tx.send(TermEvent::Resize),
+                        Ok(_) => Ok(()),
+                        Err(_) => break,
+                    },
+                    Ok(false) => Ok(()),
+                    Err(_) => break,
+                };
+                if sent.is_err() {
+                    break;
+                }
+                if last.elapsed() >= tick {
+                    if tx.send(TermEvent::Tick).is_err() {
+                        break;
+                    }
+                    last = Instant::now();
+                }
+            }
+        });
+        Self { rx }
+    }
+
+    fn next(&self) -> Result<TermEvent> {
+        self.rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("the popup stopped receiving terminal events"))
+    }
+}
+
 /// The popup's loop, on the terminal Herdr gives the popup (or any terminal,
 /// through `popup [slug]`).
 pub fn run(ctx: &Ctx, scope: Option<String>, workspace: String) -> Result<()> {
@@ -2903,29 +2964,21 @@ pub fn run(ctx: &Ctx, scope: Option<String>, workspace: String) -> Result<()> {
     // Clicks and the wheel only. Any-event tracking repaints on every move.
     let _ = out.write_all(b"\x1b[?1002l\x1b[?1003l");
     let _ = out.flush();
+    let events = Events::start(REFRESH);
     let result = (|| -> Result<()> {
-        let mut last = Instant::now();
         popup.draw(&mut out)?;
         while !popup.quit {
-            if event::poll(Duration::from_millis(250))? {
-                let draw = match event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        popup.key(key);
-                        true
-                    }
-                    Event::Mouse(mouse) => popup.mouse(mouse),
-                    Event::Resize(..) => true,
-                    _ => false,
-                };
-                if draw {
-                    popup.draw(&mut out)?;
+            let draw = match events.next()? {
+                TermEvent::Key(key) => {
+                    popup.key(key);
+                    true
                 }
-            }
-            if last.elapsed() >= REFRESH && matches!(popup.mode, Mode::List) {
-                if popup.refresh_list() {
-                    popup.draw(&mut out)?;
-                }
-                last = Instant::now();
+                TermEvent::Mouse(mouse) => popup.mouse(mouse),
+                TermEvent::Resize => true,
+                TermEvent::Tick => matches!(popup.mode, Mode::List) && popup.refresh_list(),
+            };
+            if draw {
+                popup.draw(&mut out)?;
             }
         }
         Ok(())
