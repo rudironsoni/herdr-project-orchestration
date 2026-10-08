@@ -4827,6 +4827,7 @@ fn open_records_intent_before_a_workspace_and_a_retry_does_not_create_another() 
     );
     world.runner.on("agent focus", ok(r#"{"result":{}}"#));
     world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"}}}"#));
+    *world.panes.borrow_mut() = r#"[{"pane_id":"w9:p9","tab_id":"w9:t1","workspace_id":"w9","cwd":"/somewhere","terminal_id":"term_other"}]"#.into();
     let options = crate::coordinator::OpenOptions {
         session: crate::paths::SessionFlags {
             session: None,
