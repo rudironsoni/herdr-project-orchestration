@@ -207,7 +207,7 @@ pub fn perform(ctx: &Ctx, request: &Request) -> Outcome {
         Command::Restart => restart_thread(ctx, request),
         Command::OpenConversation => focus(ctx, request, &request.pane, ""),
         Command::OpenWorker => focus(ctx, request, &request.pane, &request.machine),
-        Command::InboxDone => inbox_done(ctx, request),
+        Command::InboxDone(_) => inbox_done(ctx, request),
         Command::ToggleRoutine => toggle_routine(ctx, request),
         Command::Pause => pause(ctx, request),
         Command::Archive => set_life(ctx, request, Status::Archived),
@@ -441,13 +441,12 @@ pub(crate) fn build(
     if let Command::CopyPath(path) = command {
         request.resource = path.clone();
     }
-    if matches!(command, Command::InboxDone) {
-        let index = compose::clamp(app.side_list.selected.saturating_sub(4), snap.inbox.len());
-        if let Some(row) = snap.inbox.get(index) {
-            request.project_id = row.project_id.clone();
-            request.slug = row.slug.clone();
-            request.inbox_id = row.id.clone();
-        }
+    if let Command::InboxDone(id) = command
+        && let Some(row) = snap.inbox.iter().find(|row| row.id == *id)
+    {
+        request.project_id = row.project_id.clone();
+        request.slug = row.slug.clone();
+        request.inbox_id = id.clone();
     }
     if let Command::NextLine(line) = command {
         request.line = Some(*line);
@@ -510,7 +509,7 @@ fn intent(command: &Command, request: &Request) -> String {
         Command::SubmitThread if !request.allocated => "thread_start".into(),
         Command::SubmitThread | Command::Restart => "thread_restart".into(),
         Command::OpenConversation | Command::OpenWorker => "focus".into(),
-        Command::InboxDone => "inbox_done".into(),
+        Command::InboxDone(_) => "inbox_done".into(),
         Command::ToggleRoutine => "routine".into(),
         Command::Pause => "pause".into(),
         Command::Archive => "archive".into(),

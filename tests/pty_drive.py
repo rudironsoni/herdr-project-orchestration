@@ -67,17 +67,38 @@ def drive(argv):
             if not chunk:
                 return False
             buf.extend(chunk)
-            capture.write(chunk)
-            capture.flush()
+            if not capture.closed:
+                capture.write(chunk)
+                capture.flush()
         return proc.poll() is None
+
+    def stop():
+        if proc.poll() is not None:
+            return
+        for sig, name in ((signal.SIGTERM, "TERM"), (signal.SIGKILL, "KILL")):
+            if proc.poll() is not None:
+                return
+            try:
+                os.killpg(proc.pid, sig)
+            except OSError:
+                try:
+                    os.kill(proc.pid, sig)
+                except OSError:
+                    subprocess.run(
+                        ["/bin/kill", f"-{name}", "--", str(proc.pid)],
+                        check=False,
+                    )
+            deadline = time.time() + 1
+            while time.time() < deadline and proc.poll() is None:
+                pump(0.1)
 
     def fail(code, detail):
         capture.close()
         print(detail, file=sys.stderr)
         print(squashed(buf)[-3000:], file=sys.stderr)
+        stop()
         if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
+            print("tui still running", file=sys.stderr)
         raise SystemExit(code)
 
     for step in steps:
@@ -88,7 +109,12 @@ def drive(argv):
                 if time.time() > deadline or not pump(0.2):
                     fail(2, f"missing {needle}")
         elif "send" in step:
-            os.write(master, step["send"].encode())
+            try:
+                os.write(master, step["send"].encode())
+            except OSError:
+                if proc.poll() is not None:
+                    break
+                raise
             pump(0.08)
         elif "wait_file" in step:
             path = step["wait_file"]
@@ -100,11 +126,10 @@ def drive(argv):
         elif "hold" in step:
             pump(step["hold"])
     capture.close()
+    stop()
     if proc.poll() is None:
-        os.killpg(proc.pid, signal.SIGTERM)
-        pump(0.4)
-    if proc.poll() is None:
-        os.killpg(proc.pid, signal.SIGKILL)
+        print("tui still running", file=sys.stderr)
+        raise SystemExit(4)
     proc.wait()
 
 

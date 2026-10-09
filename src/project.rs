@@ -1141,11 +1141,6 @@ fn reconcile_priming(
             store.finish_operation(&op.id, "done", "")?;
             Ok(())
         }
-        Ok(text) if !text.contains("Written by herdr-projects") => {
-            write_priming(project, prefix)?;
-            store.finish_operation(&op.id, "done", "")?;
-            Ok(())
-        }
         _ => Err(SetupIntervention {
             path: "AGENTS.md".into(),
         }
@@ -2126,6 +2121,41 @@ mod tests {
             std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn contract_finish_setup_keeps_an_unmarked_agents_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "Ship", vec![]).unwrap();
+        begin_setup(&project, "claude", "claude").unwrap();
+        let agents = project.dir().join("AGENTS.md");
+        let claude = project.dir().join("CLAUDE.md");
+        std::fs::write(&agents, "user agents notes\n").unwrap();
+        std::fs::write(&claude, "user claude notes\n").unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        let intervention = error.downcast::<SetupIntervention>().unwrap();
+        assert_eq!(intervention.path, "AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "user agents notes\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&claude).unwrap(),
+            "user claude notes\n"
+        );
+        assert!(
+            !project
+                .dir()
+                .join("AGENTS.md.before-herdr-projects")
+                .exists()
+        );
+        assert!(
+            !project
+                .dir()
+                .join("CLAUDE.md.before-herdr-projects")
+                .exists()
+        );
+        assert!(setup_incomplete(&project).unwrap());
     }
 
     #[test]

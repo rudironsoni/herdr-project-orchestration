@@ -167,7 +167,10 @@ pub fn side_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
                 rows.push(("none".into(), Command::Nothing));
             }
             for row in &snap.inbox {
-                rows.push((format!("{} {}", row.summary, row.body), Command::InboxDone));
+                rows.push((
+                    format!("{} {}", row.summary, row.body),
+                    Command::InboxDone(row.id.clone()),
+                ));
             }
         }
     }
@@ -280,6 +283,7 @@ fn place_work(
         }
     }
     let actions = work_actions(card);
+    let tail_count = actions.len() + 1;
     let nav = card.and_then(|card| app.nav.get(&card.id));
     let action_at = nav
         .map(|nav| clamp(nav.work.selected, actions.len()))
@@ -299,7 +303,23 @@ fn place_work(
         prompt_focused,
     ));
     let focus_work = app.focus == Focus::Work && app.stack.is_empty();
-    paint_lines(out, col, rows, lines, focus_work);
+    let window = rows.end.saturating_sub(rows.start) as usize;
+    if window > 0 && lines.len() > window {
+        let tail_count = tail_count.min(window);
+        let status_room = window - tail_count;
+        let tail = lines.split_off(lines.len() - tail_count);
+        let status_end = rows.start + status_room as u16;
+        paint_lines(
+            out,
+            col,
+            rows.start..status_end,
+            lines.into_iter().take(status_room).collect(),
+            focus_work,
+        );
+        paint_lines(out, col, status_end..rows.end, tail, focus_work);
+    } else {
+        paint_lines(out, col, rows, lines, focus_work);
+    }
 }
 
 fn work_actions(card: Option<&Card>) -> Vec<(String, Command)> {

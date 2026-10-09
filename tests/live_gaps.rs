@@ -753,6 +753,9 @@ fn prompt_case(world: &World, mode: &str, needle: &str, again: bool) -> String {
         steps.push(serde_json::json!({"hold": 1}));
     }
     steps.push(serde_json::json!({"send": "\u{1b}"}));
+    steps.push(serde_json::json!({"hold": 0.2}));
+    steps.push(serde_json::json!({"send": "\u{1b}"}));
+    steps.push(serde_json::json!({"hold": 1}));
     let (text, _) = drive(world, mode, serde_json::Value::Array(steps));
     let after = world.prompt_count();
     println!("PROMPT {mode} calls {before}->{after} needle {needle}");

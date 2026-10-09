@@ -297,6 +297,101 @@ fn contract_frames_at_the_layout_breakpoints() {
 }
 
 #[test]
+fn contract_work_actions_stay_reachable_on_a_short_pane() {
+    let fixture = fixture();
+    let snap = &fixture.snap;
+    let mut app = app_on(snap);
+    app.focus = Focus::Work;
+    for (width, height) in [(80, 24), (100, 24)] {
+        let text = frame(&app, snap, width, height);
+        assert!(text.contains("Goal:"), "{width}");
+        assert!(text.contains("Start coordinator"), "{width}");
+        assert!(text.contains("Draft:"), "{width}");
+        let start = line_matching(&app, snap, width, height, |line| {
+            line.text.starts_with("Start coordinator")
+        });
+        assert_eq!(start.command, Command::StartCoordinator);
+    }
+    state::apply(&mut app, Command::Move(1), snap, 80);
+    assert_eq!(
+        input::key_command(&mut app, snap, input::key(KeyCode::Enter), 80, 24),
+        Command::StartCoordinator
+    );
+    let mut incomplete = snap.clone();
+    incomplete
+        .projects
+        .iter_mut()
+        .find(|card| card.slug == "horizon")
+        .unwrap()
+        .setup_incomplete = true;
+    let text = frame(&app, &incomplete, 80, 24);
+    assert!(text.contains("Finish setup"), "{text}");
+    let finish = line_matching(&app, &incomplete, 80, 24, |line| {
+        line.text.starts_with("Finish setup")
+    });
+    assert_eq!(finish.command, Command::FinishSetup);
+}
+
+#[test]
+fn contract_an_inbox_click_marks_the_clicked_item() {
+    let fixture = fixture();
+    let mut snap = fixture.snap.clone();
+    let project_id = horizon(&snap).id.clone();
+    snap.inbox = vec![
+        load::InboxRow {
+            project_id: project_id.clone(),
+            slug: "horizon".into(),
+            id: "in-first".into(),
+            summary: "first item".into(),
+            body: "one".into(),
+        },
+        load::InboxRow {
+            project_id,
+            slug: "horizon".into(),
+            id: "in-second".into(),
+            summary: "second item".into(),
+            body: "two".into(),
+        },
+    ];
+    let mut app = app_on(&snap);
+    app.side = Side::Inbox;
+    app.focus = Focus::Projects;
+    assert_eq!(app.side_list.selected, 0);
+    let second = line_matching(&app, &snap, 160, 40, |line| {
+        line.text.starts_with("second item")
+    });
+    let clicked = input::click_command(&app, &snap, second.x, second.y, 160, 40);
+    assert_eq!(clicked, Command::InboxDone("in-second".into()));
+    let built = crate::screen::jobs::build(&app, &snap, &clicked, Some("hp")).unwrap();
+    assert_eq!(built.inbox_id, "in-second");
+    let index = compose::side_rows(&app, &snap)
+        .iter()
+        .position(|(text, _)| text.starts_with("second item"))
+        .unwrap();
+    app.side_list.selected = index;
+    let keyed = input::key_command(&mut app, &snap, input::key(KeyCode::Enter), 160, 40);
+    assert_eq!(keyed, clicked);
+    let built = crate::screen::jobs::build(&app, &snap, &keyed, Some("hp")).unwrap();
+    assert_eq!(built.inbox_id, "in-second");
+}
+
+#[test]
+fn contract_esc_in_the_prompt_returns_to_work() {
+    let fixture = fixture();
+    let snap = &fixture.snap;
+    let mut app = app_on(snap);
+    app.focus = Focus::Prompt;
+    let id = app.project_id(snap).unwrap();
+    app.prompt_mut(&id).draft = "keep me".into();
+    let command = on_key(&mut app, snap, KeyCode::Esc);
+    assert_ne!(command, Command::Quit);
+    assert_eq!(app.focus, Focus::Work);
+    assert_eq!(app.prompts[&id].draft, "keep me");
+    assert!(app.stack.is_empty());
+    assert_eq!(on_key(&mut app, snap, KeyCode::Esc), Command::Quit);
+}
+
+#[test]
 fn contract_keys_and_clicks_use_the_same_command() {
     let fixture = fixture();
     let snap = &fixture.snap;

@@ -303,7 +303,7 @@ pub enum Command {
     SubmitField,
     Cancel,
     ConfirmYes,
-    InboxDone,
+    InboxDone(String),
     ToggleRoutine,
     OpenMenu,
     Pause,
@@ -486,7 +486,13 @@ pub fn apply(app: &mut App, command: Command, snap: &Snapshot, width: u16) -> Co
             app.g = false;
             app.filter = None;
             if app.stack.pop().is_none() {
-                Command::Quit
+                if app.focus == Focus::Prompt {
+                    app.focus = Focus::Work;
+                    app.one = Focus::Work;
+                    Command::Nothing
+                } else {
+                    Command::Quit
+                }
             } else {
                 Command::Nothing
             }
@@ -624,12 +630,11 @@ pub fn apply(app: &mut App, command: Command, snap: &Snapshot, width: u16) -> Co
             command,
         ),
         Command::ConfirmYes => confirm_yes(app),
-        Command::ReadLibrary | Command::Notes | Command::InboxDone => {
-            if !matches!(command, Command::InboxDone) {
-                app.stack.push(Layer::Detail);
-            }
+        Command::ReadLibrary | Command::Notes => {
+            app.stack.push(Layer::Detail);
             command
         }
+        Command::InboxDone(_) => command,
         Command::OpenSafety => {
             app.safety_list = ListPos::default();
             app.stack.push(Layer::Safety);
@@ -965,9 +970,7 @@ fn move_list(app: &mut App, snap: &Snapshot, delta: i32) {
         Focus::Work => {
             if let Some(id) = current_id(app, snap) {
                 let len = work_len(app.card(snap));
-                if let Some(nav) = app.nav.get_mut(&id) {
-                    nav.work.move_by(delta, len, window);
-                }
+                app.nav_mut(&id).work.move_by(delta, len, window);
             }
         }
         Focus::Overview => {
