@@ -5,7 +5,7 @@ use crate::screen::compose::{self, Placed};
 use crate::screen::draw;
 use crate::screen::input;
 use crate::screen::load::{self, Snapshot};
-use crate::screen::state::{self, App, Command, Focus, Side};
+use crate::screen::state::{self, App, Columns, Command, Focus, Side};
 use crate::thread::{self, Kind, Status};
 
 struct Fixture {
@@ -250,10 +250,28 @@ fn contract_frames_at_the_layout_breakpoints() {
     assert!(threads.iter().any(|thread| thread.status == Status::Failed));
 
     let mut app = app_on(snap);
+    assert_eq!(state::columns(79), Columns::TooSmall);
+    assert_eq!(state::columns(80), Columns::One);
+    let tiny_lines: Vec<_> = compose::plan(&app, snap, 79, 24)
+        .into_iter()
+        .map(|line| line.text)
+        .collect();
+    assert_eq!(
+        tiny_lines,
+        vec![
+            "HERDR PROJECTS".to_string(),
+            "Terminal is too small".to_string(),
+            "79x24".to_string(),
+        ]
+    );
     let tiny = frame(&app, snap, 79, 24);
     assert!(tiny.contains("Terminal is too small"));
     assert!(tiny.contains("79x24"));
     assert!(!tiny.contains("Current work"));
+    assert!(!tiny.contains("New Project"));
+    assert!(!tiny.contains("Threads"));
+    assert!(!tiny.contains("Start coordinator"));
+    assert!(!tiny.contains("Draft:"));
     save_frame("79x24.txt", &tiny);
     let narrow = frame(&app, snap, 80, 24);
     assert!(narrow.contains("Current work"));
