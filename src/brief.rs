@@ -228,7 +228,7 @@ fn step(
     }
     bump(project, t)?;
     match herdr.agent_prompt_confirmed(&t.pane_id, &thread::launch_prompt(&project.slug, &t.id)) {
-        Ok(()) => Ok(Outcome::Delivered),
+        Ok(_) => Ok(Outcome::Delivered),
         Err(error) if crate::herdr::refused_before_typing(&error) => {
             t.brief_attempts -= 1;
             Ok(Outcome::Waiting(format!("{error}")))

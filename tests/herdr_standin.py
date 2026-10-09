@@ -187,7 +187,7 @@ if kind == ["workspace", "create"]:
 
 if kind == ["worktree", "create"]:
     proc = delegate(args)
-    if proc.returncode == 0 and MARKER:
+    if proc.returncode == 0 and MARKER and current_mode() == "hold":
         with open(MARKER, "w", encoding="utf-8") as handle:
             handle.write(proc.stdout)
         time.sleep(30)

@@ -893,7 +893,10 @@ pub fn prompt_confirmed(ctx: &Ctx, slug: &str, text: &str) -> Result<PromptDeliv
         .herdr
         .agent_prompt_confirmed(&ready.pane_id, &ready.text)
     {
-        Ok(()) => Ok(PromptDelivery::Confirmed),
+        Ok(value) => match value["agent"]["agent_status"].as_str() {
+            Some("working" | "blocked") => Ok(PromptDelivery::Confirmed),
+            _ => Ok(PromptDelivery::Uncertain),
+        },
         Err(error) => match error.code.as_str() {
             "agent_prompt_stalled" | "timeout" | "no_reply" => Ok(PromptDelivery::Uncertain),
             _ => Err(anyhow::anyhow!("{error}")),

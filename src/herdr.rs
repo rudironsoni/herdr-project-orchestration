@@ -139,7 +139,9 @@ impl std::fmt::Display for HerdrError {
 
 impl std::error::Error for HerdrError {}
 
-pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
+/// Long enough for a cold Claude to show its trust dialog. A 20s wait ends
+/// as `timeout` and drops the agent; `agent_not_ready` leaves it in place.
+pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long `agent_prompt_confirmed` lets herdr wait for the agent to start.
 pub const PROMPT_WAIT: Duration = Duration::from_secs(8);
 
@@ -557,12 +559,14 @@ impl<'a> Herdr<'a> {
             .map(|_| ())
     }
 
-    /// Submits a prompt and waits until the agent is seen `working` (or
-    /// `blocked`, a question it asked): herdr's own proof that the text was
-    /// taken, not only typed. `agent_prompt_stalled` (herdr saw neither within
-    /// its 5 s), a timeout or a reply without a result mean the text may or may
-    /// not sit in the input box: callers never type it again blindly.
-    pub fn agent_prompt_confirmed(&self, target: &str, text: &str) -> Result<(), HerdrError> {
+    /// Submits a prompt with `agent prompt --wait --until working --until
+    /// blocked` and returns the result object. A null result is `no_reply`.
+    /// Exit 0 is not the observation: read `agent.agent_status`.
+    pub fn agent_prompt_confirmed(
+        &self,
+        target: &str,
+        text: &str,
+    ) -> Result<serde_json::Value, HerdrError> {
         let timeout_ms = PROMPT_WAIT.as_millis().to_string();
         let args = [
             "agent",
@@ -582,7 +586,7 @@ impl<'a> Herdr<'a> {
                 code: "no_reply".into(),
                 message: "`herdr agent prompt --wait` answered without a result".into(),
             }),
-            _ => Ok(()),
+            value => Ok(value),
         }
     }
 

@@ -5057,6 +5057,27 @@ fn contract_confirmed_prompt_uses_the_bound_coordinator_once() {
     world
         .runner
         .on("agent prompt", ok(r#"{"result":{"ok":true}}"#));
+    let blind = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap();
+    assert_eq!(blind, coordinator::PromptDelivery::Uncertain);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    show_coordinator(&world, &project, "idle");
+    world.runner.on(
+        "agent prompt",
+        ok(r#"{"result":{"agent":{"agent_status":"blocked"}}}"#),
+    );
+    let blocked = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap();
+    assert_eq!(blocked, coordinator::PromptDelivery::Confirmed);
+
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    show_coordinator(&world, &project, "idle");
+    world.runner.on(
+        "agent prompt",
+        ok(r#"{"result":{"agent":{"agent_status":"working"}}}"#),
+    );
     let delivery = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap();
     assert_eq!(delivery, coordinator::PromptDelivery::Confirmed);
     assert_eq!(
@@ -5203,9 +5224,10 @@ fn contract_a_stale_pane_is_not_the_prompt_target() {
         ),
         stale
     );
-    world
-        .runner
-        .on("agent prompt", ok(r#"{"result":{"ok":true}}"#));
+    world.runner.on(
+        "agent prompt",
+        ok(r#"{"result":{"agent":{"agent_status":"working"}}}"#),
+    );
     let delivery = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap();
     assert_eq!(delivery, coordinator::PromptDelivery::Confirmed);
     let calls = world.runner.calls.borrow();
@@ -5227,9 +5249,10 @@ fn contract_the_screen_prompts_the_bound_pane() {
     let project = world.project("demo", "a.sock");
     let record = project.coordinator().unwrap();
     show_coordinator(&world, &project, "idle");
-    world
-        .runner
-        .on("agent prompt", ok(r#"{"result":{"ok":true}}"#));
+    world.runner.on(
+        "agent prompt",
+        ok(r#"{"result":{"agent":{"agent_status":"working"}}}"#),
+    );
     let request = crate::screen::jobs::Request {
         command: crate::screen::state::Command::SubmitPrompt,
         slug: "demo".into(),

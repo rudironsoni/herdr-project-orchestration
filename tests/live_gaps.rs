@@ -1,9 +1,10 @@
 //! Shipped-binary evidence for the worktree crash window, `o`, and prompts.
 //!
 //! Herdr is the disposable session `hpo-tui-gap` on the real HOME, so Claude
-//! can start. Missing, blocked, unknown, refused, and uncertain stay on the
-//! stand-in. The confirmed prompt is delegated, and it counts only when that
-//! reply reports the bound agent `working` or `blocked`.
+//! can start. `open` starts the coordinator. Missing, blocked, unknown,
+//! refused, and uncertain stay on the stand-in. The confirmed prompt is
+//! delegated, and it counts only when that reply reports the bound agent
+//! `working` or `blocked`. A finished worktree thread stores its path once.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -215,18 +216,8 @@ impl World {
             project_dir,
             ..world
         };
-        world.set_mode("setup");
-        let opened = world.hp(&[
-            "--root",
-            world.root.to_str().unwrap(),
-            "open",
-            "accept",
-            "--socket",
-            world.socket.to_str().unwrap(),
-        ]);
-        assert!(opened.status.success(), "{}", output_text(&opened));
-        world.set_mode("idle");
         let _ = server_log;
+        open_coordinator(&world);
         world
     }
 
@@ -252,6 +243,16 @@ impl World {
         let mut cmd = Command::new(BIN);
         self.envs(&mut cmd);
         cmd.args(args).output().unwrap()
+    }
+
+    fn spawn_hp(&self, args: &[&str], out: &Path, err: &Path) -> Child {
+        let mut cmd = Command::new(BIN);
+        self.envs(&mut cmd);
+        cmd.args(args)
+            .stdout(File::create(out).unwrap())
+            .stderr(File::create(err).unwrap())
+            .spawn()
+            .unwrap()
     }
 
     fn prompt_count(&self) -> usize {
@@ -339,22 +340,136 @@ fn agent_status(world: &World, pane: &str) -> String {
 
 /// Starts Claude in `pane` and accepts the folder-trust dialog until Herdr
 /// reports `idle`. The dialog's first choice is "No, exit".
-fn bring_up(world: &World, pane: &str, name: &str) {
-    let started = world.real(&[
+fn answer_trust_dialog(world: &World, pane: &str) -> String {
+    let read = world.real(&[
         "agent",
-        "start",
-        name,
-        "--kind",
-        "claude",
-        "--pane",
+        "read",
         pane,
-        "--timeout",
-        "90000",
-        "--",
-        "--dangerously-skip-permissions",
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        "80",
     ]);
-    let start_text = output_text(&started);
+    let mut text = String::from_utf8_lossy(&read.stdout).into_owned();
+    if text.trim().is_empty() {
+        text = String::from_utf8_lossy(&read.stderr).into_owned();
+    }
+    if text.contains("Yes, I trust this folder")
+        || text.contains("Yes, I accept")
+        || text.contains("Quick safety check")
+    {
+        let _ = world.real(&["agent", "send-keys", pane, "down"]);
+        let _ = world.real(&["agent", "send-keys", pane, "enter"]);
+    }
+    text
+}
+
+fn agent_starts(world: &World) -> Vec<serde_json::Value> {
+    log_lines(&world.log)
+        .into_iter()
+        .filter(|line| line["argv"][0] == "agent" && line["argv"][1] == "start")
+        .collect()
+}
+
+fn open_coordinator(world: &World) {
+    world.set_mode("live");
+    let out = world.files.path().join("open.out");
+    let err = world.files.path().join("open.err");
+    let mut child = world.spawn_hp(
+        &[
+            "--root",
+            world.root.to_str().unwrap(),
+            "open",
+            "accept",
+            "--socket",
+            world.socket.to_str().unwrap(),
+        ],
+        &out,
+        &err,
+    );
+    let deadline = Instant::now() + Duration::from_secs(150);
+    let mut pane = String::new();
+    loop {
+        if pane.is_empty() {
+            pane = world.bound_pane();
+        } else {
+            answer_trust_dialog(world, &pane);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = fs::read_to_string(&out).unwrap_or_default();
+                let stderr = fs::read_to_string(&err).unwrap_or_default();
+                assert!(status.success(), "open failed\n{stdout}\n{stderr}");
+                break;
+            }
+            Ok(None) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "open did not finish\n{}",
+                    fs::read_to_string(&world.log).unwrap_or_default()
+                );
+                thread::sleep(Duration::from_millis(300));
+            }
+            Err(error) => panic!("open wait failed: {error}"),
+        }
+    }
+    assert!(!pane.is_empty(), "open did not record a herdr pane");
+    let idle_deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_status;
+    let mut last_screen;
+    loop {
+        last_screen = answer_trust_dialog(world, &pane);
+        last_status = agent_status(world, &pane);
+        if last_status == "idle" {
+            break;
+        }
+        assert!(
+            Instant::now() < idle_deadline,
+            "coordinator on {pane} did not become idle after open\nstatus {last_status}\n{last_screen}\n{}",
+            fs::read_to_string(&world.log).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+    let starts = agent_starts(world);
+    assert!(!starts.is_empty(), "open did not start an agent");
+    assert!(
+        starts.iter().all(|line| line["delegated"] == true),
+        "agent start did not go through herdr\n{starts:?}"
+    );
+    println!(
+        "OPEN coordinator pane {pane} status idle starts {}",
+        starts.len()
+    );
+    world.set_mode("idle");
+}
+
+fn bring_up(world: &World, pane: &str, name: &str) {
     let deadline = Instant::now() + Duration::from_secs(90);
+    let start_text = loop {
+        assert!(
+            Instant::now() < deadline,
+            "agent {name} on {pane} stayed busy"
+        );
+        let started = world.real(&[
+            "agent",
+            "start",
+            name,
+            "--kind",
+            "claude",
+            "--pane",
+            pane,
+            "--timeout",
+            "90000",
+            "--",
+            "--dangerously-skip-permissions",
+        ]);
+        let start_text = output_text(&started);
+        if start_text.contains("agent_pane_busy") {
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        break start_text;
+    };
     loop {
         let read = world.real(&[
             "agent",
@@ -497,6 +612,7 @@ fn drive(world: &World, name: &str, steps: serde_json::Value) -> (String, u32) {
         .arg("--root")
         .arg(&world.root)
         .arg("popup")
+        .arg("--next")
         .arg("accept");
     let mut child = cmd.spawn().unwrap();
     let started = Instant::now();
@@ -552,6 +668,7 @@ fn drive_until_marker(world: &World) -> u32 {
         .arg("--root")
         .arg(&world.root)
         .arg("popup")
+        .arg("--next")
         .arg("accept");
     let mut child = cmd.spawn().unwrap();
     let started = Instant::now();
@@ -685,7 +802,7 @@ fn live_crash_window_open_worker_and_prompt_outcomes() {
     );
     assert!(!uncertain.contains("replied"), "{uncertain}");
 
-    bring_up(&world, &pane, "hpc-accept");
+    let starts_before_prompt = agent_starts(&world).len();
     let before_live = world.prompt_count();
     let live = prompt_case(&world, "live", "Confirmed", false);
     assert!(!live.contains("replied"), "{live}");
@@ -722,6 +839,11 @@ fn live_crash_window_open_worker_and_prompt_outcomes() {
         "herdr did not observe the bound agent\n{observed}"
     );
     println!("OBSERVED status {status} pane {pane}");
+    assert_eq!(
+        agent_starts(&world).len(),
+        starts_before_prompt,
+        "confirmed prompt started another agent"
+    );
 
     world.set_mode("idle");
     let task = world.files.path().join("task.md");
@@ -784,6 +906,8 @@ fn live_crash_window_open_worker_and_prompt_outcomes() {
     );
 
     world.set_mode("idle");
+    finish_worktree(&world);
+    world.set_mode("hold");
     let _ = fs::remove_file(&world.marker);
     let killed = drive_until_marker(&world);
     println!("KILLED tui pid {killed}");
@@ -831,14 +955,19 @@ fn live_crash_window_open_worker_and_prompt_outcomes() {
             >= 2,
         "{listed}"
     );
+    let gap_id = gap["id"].as_str().unwrap().to_string();
     let create = log_lines(&world.log)
         .into_iter()
         .find(|line| {
             line["argv"][0] == "worktree"
                 && line["argv"][1] == "create"
                 && line["delegated"] == true
+                && line["argv"].as_array().is_some_and(|argv| {
+                    argv.iter()
+                        .any(|item| item.as_str().unwrap_or("").contains(gap_id.as_str()))
+                })
         })
-        .expect("worktree create was not delegated");
+        .unwrap_or_else(|| panic!("worktree create for {gap_id} was not delegated"));
     let branch = create["argv"]
         .as_array()
         .unwrap()
@@ -899,6 +1028,53 @@ fn live_crash_window_open_worker_and_prompt_outcomes() {
         gap["id"],
         op["id"],
         trees_before.len()
+    );
+}
+
+fn finish_worktree(world: &World) {
+    let before_threads = inspect(world)["threads"].as_array().unwrap().len();
+    let before_trees = worktree_paths(&world.repo);
+    let task = world.files.path().join("wt-task.md");
+    fs::write(&task, "Do the work.\n").unwrap();
+    let started = world.hp(&[
+        "--root",
+        world.root.to_str().unwrap(),
+        "thread",
+        "start",
+        "accept",
+        "--title",
+        "Finished",
+        "--kind",
+        "worktree",
+        "--repo",
+        world.repo.to_str().unwrap(),
+        "--task-file",
+        task.to_str().unwrap(),
+    ]);
+    assert!(started.status.success(), "{}", output_text(&started));
+    let rows = inspect(world);
+    let threads = rows["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), before_threads + 1);
+    let thread = threads
+        .iter()
+        .find(|row| row["title"] == "Finished")
+        .unwrap_or_else(|| panic!("{rows}"));
+    let path = thread["worktree_path"].as_str().unwrap();
+    assert!(!path.is_empty(), "{thread}");
+    assert!(Path::new(path).is_dir(), "{path}");
+    let trees = worktree_paths(&world.repo);
+    assert_eq!(trees.len(), before_trees.len() + 1, "{trees:?}");
+    assert_eq!(
+        threads
+            .iter()
+            .filter(|row| row["title"] == "Finished")
+            .count(),
+        1
+    );
+    println!(
+        "WORKTREE id {} path {path} trees {}",
+        thread["id"],
+        trees.len()
     );
 }
 
