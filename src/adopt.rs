@@ -214,14 +214,18 @@ pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
         })
         .unwrap_or_default();
 
-    let project = project::create(&ctx.root, &args.name, &args.goal, repos)?;
     let config = crate::profiles::load(&ctx.config_dir)?;
-    crate::profiles::write_project_defaults(
-        &project,
-        &config.new_project_default(crate::profiles::Role::Thread),
-        &config.new_project_default(crate::profiles::Role::Coordinator),
+    let project = project::create_with_setup(
+        &ctx.root,
+        &project::NewProject {
+            name: args.name.clone(),
+            goal: args.goal.clone(),
+            repos,
+            thread_profile: config.new_project_default(crate::profiles::Role::Thread),
+            coordinator_profile: config.new_project_default(crate::profiles::Role::Coordinator),
+            prefix: coordinator::current_prefix(&ctx.root)?,
+        },
     )?;
-    project::write_priming(&project, &coordinator::current_prefix(&ctx.root)?)?;
     println!("created `{}` at {}", project.slug, project.dir().display());
     coordinator::open(
         ctx,

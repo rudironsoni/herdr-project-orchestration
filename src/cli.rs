@@ -248,6 +248,12 @@ enum Command {
     Popup {
         /// Scope it to one project (default: the current workspace's, else all)
         slug: Option<String>,
+        /// Open the Ratatui screen. This is the default
+        #[arg(long)]
+        next: bool,
+        /// Open the previous screen
+        #[arg(long, conflicts_with = "next")]
+        classic: bool,
     },
     /// Install the plugin's progress hooks (Claude Code, Codex, Droid, Gemini CLI, Copilot CLI) and its `autoproject` skill (Claude Code, Codex)
     Configure {
@@ -723,12 +729,20 @@ pub fn run() -> Result<()> {
                     bail!("there is no profile `{name}`; `profile list` shows them");
                 }
             }
-            let project = project::create(&ctx.root, &name, &goal, repos)?;
-            crate::profiles::write_project_defaults(&project, &thread, &coordinator)?;
             let prefix = coordinator::current_prefix(&ctx.root)?;
-            project::write_priming(&project, &prefix)?;
+            let project = project::create_with_setup(
+                &ctx.root,
+                &project::NewProject {
+                    name,
+                    goal,
+                    repos,
+                    thread_profile: thread,
+                    coordinator_profile: coordinator,
+                    prefix: prefix.clone(),
+                },
+            )?;
             println!("created `{}` at {}", project.slug, project.dir().display());
-            println!("next: {prefix} open {}", project.slug);
+            println!("next: {prefix} popup {}", project.slug);
             Ok(())
         }
         Command::Migrate {
@@ -986,13 +1000,25 @@ pub fn run() -> Result<()> {
             }
             crate::settings::system_open(&ctx, &url)
         }
-        Command::Popup { slug } => {
-            let scope = match slug {
-                Some(slug) => Some(slug),
-                None => overview::resolve_slug_quiet(&ctx),
-            };
-            let workspace = ctx.env.var("HERDR_WORKSPACE_ID").unwrap_or("").to_string();
-            crate::popup::run(&ctx, scope, workspace)
+        Command::Popup {
+            slug,
+            next,
+            classic,
+        } => {
+            if popup_uses_next(next, classic) {
+                let scope = match slug {
+                    Some(name) => Some(resolve_popup_name(&ctx, &name)?),
+                    None => overview::resolve_slug_quiet(&ctx),
+                };
+                crate::screen::run(&ctx, scope)
+            } else {
+                let scope = match slug {
+                    Some(slug) => Some(slug),
+                    None => overview::resolve_slug_quiet(&ctx),
+                };
+                let workspace = ctx.env.var("HERDR_WORKSPACE_ID").unwrap_or("").to_string();
+                crate::popup::run(&ctx, scope, workspace)
+            }
         }
         Command::Routine { command } => match command {
             RoutineCommand::Toggle {
@@ -1200,5 +1226,96 @@ pub fn run() -> Result<()> {
             TickerCommand::Stop => ticker::stop(&ctx.root),
             TickerCommand::Status => ticker::status(&ctx.root),
         },
+    }
+}
+
+pub(crate) fn popup_uses_next(next: bool, classic: bool) -> bool {
+    next || !classic
+}
+
+fn resolve_popup_name(ctx: &Ctx, query: &str) -> Result<String> {
+    let index = project::import_and_list(&ctx.root)?;
+    let mut named = Vec::new();
+    for row in &index.projects {
+        let display_name = Project::load(&ctx.root, &row.slug)
+            .ok()
+            .and_then(|project| project.read_project_md().ok())
+            .map(|(settings, _)| settings.name)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| row.slug.clone());
+        named.push(project::NamedProject {
+            slug: row.slug.clone(),
+            display_name,
+        });
+    }
+    project::resolve_open_name(&named, query)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_flag_chooses_the_same_screen_twice() {
+        let first = Cli::try_parse_from(["herdr-projects", "popup", "--next"]).unwrap();
+        let second = Cli::try_parse_from(["herdr-projects", "popup", "--next"]).unwrap();
+        match (first.command, second.command) {
+            (
+                Command::Popup {
+                    next: a,
+                    classic: ac,
+                    ..
+                },
+                Command::Popup {
+                    next: b,
+                    classic: bc,
+                    ..
+                },
+            ) => {
+                assert!(popup_uses_next(a, ac));
+                assert_eq!(popup_uses_next(a, ac), popup_uses_next(b, bc));
+            }
+            _ => panic!("popup did not parse"),
+        }
+        let classic = Cli::try_parse_from(["herdr-projects", "popup"]).unwrap();
+        let again = Cli::try_parse_from(["herdr-projects", "popup"]).unwrap();
+        match (classic.command, again.command) {
+            (
+                Command::Popup {
+                    next: a,
+                    classic: ac,
+                    ..
+                },
+                Command::Popup {
+                    next: b,
+                    classic: bc,
+                    ..
+                },
+            ) => {
+                assert!(popup_uses_next(a, ac));
+                assert_eq!(popup_uses_next(a, ac), popup_uses_next(b, bc));
+            }
+            _ => panic!("popup did not parse"),
+        }
+        let old = Cli::try_parse_from(["herdr-projects", "popup", "--classic"]).unwrap();
+        let old_again = Cli::try_parse_from(["herdr-projects", "popup", "--classic"]).unwrap();
+        match (old.command, old_again.command) {
+            (
+                Command::Popup {
+                    next: a,
+                    classic: ac,
+                    ..
+                },
+                Command::Popup {
+                    next: b,
+                    classic: bc,
+                    ..
+                },
+            ) => {
+                assert!(!popup_uses_next(a, ac));
+                assert_eq!(popup_uses_next(a, ac), popup_uses_next(b, bc));
+            }
+            _ => panic!("popup did not parse"),
+        }
     }
 }

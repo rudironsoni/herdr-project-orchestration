@@ -3615,7 +3615,7 @@ fn fit(text: &str, width: usize) -> String {
 }
 
 /// Copies text to the clipboard with the platform's tool.
-fn copy(text: &str) -> String {
+pub(crate) fn copy(text: &str) -> String {
     use std::process::{Command, Stdio};
     let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]

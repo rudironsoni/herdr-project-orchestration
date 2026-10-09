@@ -898,10 +898,11 @@ fn thread_start_is_refused_when_paused() {
         base: None,
         task: "t".into(),
     };
-    let error = threads::start(&world.ctx(), "demo", args)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("paused"), "{error}");
+    let result = threads::start(&world.ctx(), "demo", args);
+    let form = threads::form_after_start(result);
+    assert!(form.id.is_none());
+    assert!(!threads::repeat_start_refused(&form));
+    assert!(form.error.unwrap().contains("paused"));
     assert!(thread::list(&project).is_empty());
 }
 
@@ -4900,4 +4901,366 @@ fn adopt_on_a_named_machine_stores_that_environment() {
             .any(|cmd| cmd.display().contains("--machine") && cmd.display().contains("box"))
     );
     let _ = socket;
+}
+
+fn show_coordinator(world: &World, project: &Project, status: &str) {
+    let cwd = project.canonical_dir().to_string_lossy().into_owned();
+    let record = project.coordinator().unwrap();
+    *world.agents.borrow_mut() = format!(
+        "[{}]",
+        agent_json(
+            &record.workspace_id,
+            &record.tab_id,
+            &record.pane_id,
+            &cwd,
+            "hp-demo-coordinator",
+            status
+        )
+    );
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(project));
+}
+
+fn tab_args() -> StartArgs {
+    StartArgs {
+        title: "Clean up".into(),
+        repo: None,
+        machine: None,
+        profile: None,
+        kind: Some(Kind::Tab),
+        base: None,
+        task: "Tidy.".into(),
+    }
+}
+
+#[test]
+fn contract_a_failed_provision_exposes_the_allocated_id() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    show_coordinator(&world, &project, "idle");
+    let form = threads::form_after_start(threads::start(&world.ctx(), "demo", tab_args()));
+    assert_eq!(form.id.as_deref(), Some("t-0001"));
+    assert_eq!(form.status, Some(Status::Failed));
+    assert!(form.operation_id.is_some());
+    assert!(threads::repeat_start_refused(&form));
+    assert_eq!(thread::list(&project).len(), 1);
+    assert_eq!(
+        thread::load(&project, "t-0001").unwrap().status,
+        Status::Failed
+    );
+    let recovery = threads::recover_start(&project).unwrap();
+    assert_eq!(
+        recovery,
+        threads::StartRecovery::Recorded {
+            id: "t-0001".into(),
+            operation_id: form.operation_id.unwrap(),
+        }
+    );
+}
+
+#[test]
+fn contract_a_pending_start_is_recovered_without_a_second_thread() {
+    let world = World::new();
+    let first = world.project("alpha", "a.sock");
+    let second = world.project("beta", "b.sock");
+    let thread = thread::allocate(&first, |record| {
+        record.title = "Work".into();
+        record.kind = Kind::Worktree;
+    })
+    .unwrap();
+    let op = threads::begin_thread_start(&first, &thread.id).unwrap();
+    assert_eq!(op.project_id, first.open_row().unwrap().1.id);
+    assert_eq!(op.target_id.as_deref(), Some(thread.id.as_str()));
+    assert_eq!(op.status, "pending");
+    let store = crate::store::Store::open(&world.root).unwrap();
+    let row = first.open_row().unwrap().1;
+    let stored = store.latest_kind(&row.id, "thread_start").unwrap().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&stored.payload).unwrap();
+    assert!(value.get("panel").is_none());
+    assert_eq!(value.as_object().unwrap().len(), 2);
+    assert!(threads::current_thread_start(&second).unwrap().is_none());
+    show_coordinator(&world, &first, "idle");
+    let mut same = tab_args();
+    same.title = thread.title.clone();
+    let form = threads::form_after_start(threads::start(&world.ctx(), "alpha", same));
+    assert_eq!(form.id.as_deref(), Some(thread.id.as_str()));
+    assert_eq!(thread::list(&first).len(), 1);
+    assert!(thread::list(&second).is_empty());
+    let again = threads::current_thread_start(&first).unwrap().unwrap();
+    assert_eq!(again.project_id, op.project_id);
+    assert_eq!(again.operation_id, op.operation_id);
+    assert!(matches!(
+        threads::recover_start(&first).unwrap(),
+        threads::StartRecovery::Unresolved { .. }
+    ));
+    let other = threads::form_after_start(threads::start(&world.ctx(), "alpha", tab_args()));
+    assert_ne!(other.id.as_deref(), Some(thread.id.as_str()));
+    assert!(other.id.is_some());
+    assert_eq!(thread::list(&first).len(), 2);
+    let kept = threads::current_thread_start(&first).unwrap().unwrap();
+    assert_eq!(kept.operation_id, op.operation_id);
+}
+
+#[test]
+fn contract_an_unrecorded_worktree_is_not_attached() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let thread = thread::allocate(&project, |record| {
+        record.title = "Work".into();
+        record.kind = Kind::Worktree;
+        record.branch = "hp/demo/t-0001-work".into();
+    })
+    .unwrap();
+    threads::begin_thread_start(&project, &thread.id).unwrap();
+    let stray = world.home.path().join("stray-worktree");
+    std::fs::create_dir(&stray).unwrap();
+    let recovery = threads::recover_start(&project).unwrap();
+    assert!(matches!(
+        recovery,
+        threads::StartRecovery::Unresolved { .. }
+    ));
+    assert!(
+        thread::load(&project, &thread.id)
+            .unwrap()
+            .worktree_path
+            .is_empty()
+    );
+    assert_eq!(thread::list(&project).len(), 1);
+    let _ = stray;
+}
+
+#[test]
+fn contract_a_recorded_worktree_stays_on_the_same_thread() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let path = world.home.path().join("wt");
+    std::fs::create_dir(&path).unwrap();
+    let thread = thread::allocate(&project, |record| {
+        record.title = "Work".into();
+        record.kind = Kind::Worktree;
+        record.branch = "hp/demo/t-0001-work".into();
+        record.worktree_path = path.display().to_string();
+    })
+    .unwrap();
+    threads::begin_thread_start(&project, &thread.id).unwrap();
+    match threads::recover_start(&project).unwrap() {
+        threads::StartRecovery::Recorded { id, .. } => assert_eq!(id, thread.id),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(thread::list(&project).len(), 1);
+}
+
+#[test]
+fn contract_confirmed_prompt_uses_the_bound_coordinator_once() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    show_coordinator(&world, &project, "idle");
+    world
+        .runner
+        .on("agent prompt", ok(r#"{"result":{"ok":true}}"#));
+    let delivery = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap();
+    assert_eq!(delivery, coordinator::PromptDelivery::Confirmed);
+    assert_eq!(
+        coordinator::prompt_field(&Ok(delivery)),
+        coordinator::PromptField::Confirmed
+    );
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    let calls = world.runner.calls.borrow();
+    let prompt = calls
+        .iter()
+        .find(|cmd| cmd.display().contains("agent prompt"))
+        .unwrap();
+    assert!(prompt.display().contains("--wait"), "{}", prompt.display());
+    assert!(prompt.display().contains("working"), "{}", prompt.display());
+    assert_eq!(prompt_text(prompt), "look here");
+    let record = project.coordinator().unwrap();
+    assert!(prompt.display().contains(&record.pane_id));
+}
+
+#[test]
+fn contract_an_uncertain_prompt_is_not_sent_again() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    show_coordinator(&world, &project, "idle");
+    world.runner.on(
+        "agent prompt",
+        fail(
+            1,
+            r#"{"error":{"code":"agent_prompt_stalled","message":"agent did not start working"}}"#,
+        ),
+    );
+    let delivery = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap();
+    assert_eq!(delivery, coordinator::PromptDelivery::Uncertain);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert_eq!(
+        coordinator::prompt_field(&Ok(delivery)),
+        coordinator::PromptField::Uncertain
+    );
+}
+
+#[test]
+fn contract_a_blocked_or_missing_coordinator_sends_nothing() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    show_coordinator(&world, &project, "blocked");
+    let error = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap_err();
+    assert_eq!(world.runner.count("agent prompt"), 0);
+    assert_eq!(
+        coordinator::prompt_field(&Err(error)),
+        coordinator::PromptField::Refused
+    );
+    *world.agents.borrow_mut() = "[]".into();
+    let error = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap_err();
+    assert_eq!(world.runner.count("agent prompt"), 0);
+    assert_eq!(
+        coordinator::prompt_field(&Err(error)),
+        coordinator::PromptField::Refused
+    );
+    let error = coordinator::prompt_confirmed(&world.ctx(), "demo", "  ").unwrap_err();
+    assert_eq!(
+        coordinator::prompt_field(&Err(error)),
+        coordinator::PromptField::Refused
+    );
+    assert_eq!(
+        coordinator::prompt_field_after_open_tab(),
+        coordinator::PromptField::Draft
+    );
+}
+
+#[test]
+fn contract_a_refused_prompt_call_is_not_repeated() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    show_coordinator(&world, &project, "idle");
+    world.runner.on(
+        "agent prompt",
+        fail(
+            1,
+            r#"{"error":{"code":"agent_blocked","message":"blocked"}}"#,
+        ),
+    );
+    let error = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap_err();
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert_eq!(
+        coordinator::prompt_field(&Err(error)),
+        coordinator::PromptField::Refused
+    );
+}
+
+#[test]
+fn contract_prompt_submit_moves_draft_and_refused_only() {
+    use coordinator::{PromptField, begin_prompt_submit, note_prompt_edit};
+    assert_eq!(
+        begin_prompt_submit(PromptField::Draft),
+        Some(PromptField::Submitting)
+    );
+    assert_eq!(
+        begin_prompt_submit(PromptField::Refused),
+        Some(PromptField::Submitting)
+    );
+    assert_eq!(begin_prompt_submit(PromptField::Submitting), None);
+    assert_eq!(begin_prompt_submit(PromptField::Confirmed), None);
+    assert_eq!(begin_prompt_submit(PromptField::Uncertain), None);
+    assert_eq!(
+        note_prompt_edit(PromptField::Submitting),
+        PromptField::Submitting
+    );
+    assert_eq!(note_prompt_edit(PromptField::Confirmed), PromptField::Draft);
+    assert_eq!(note_prompt_edit(PromptField::Refused), PromptField::Draft);
+    assert_eq!(note_prompt_edit(PromptField::Uncertain), PromptField::Draft);
+}
+
+#[test]
+fn contract_an_unknown_coordinator_is_not_ready() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    show_coordinator(&world, &project, "unknown");
+    let error = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap_err();
+    assert_eq!(world.runner.count("agent prompt"), 0);
+    assert_eq!(
+        coordinator::prompt_field(&Err(error)),
+        coordinator::PromptField::Refused
+    );
+}
+
+#[test]
+fn contract_a_stale_pane_is_not_the_prompt_target() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let record = project.coordinator().unwrap();
+    let cwd = project.canonical_dir().to_string_lossy().into_owned();
+    let stale = format!(
+        r#"{{"pane_id":"w9:p9","tab_id":"w9:t9","workspace_id":"w9","cwd":"{cwd}","name":"other","agent":"claude","agent_status":"idle","state_change_seq":99}}"#
+    );
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json(
+            &record.workspace_id,
+            &record.tab_id,
+            &record.pane_id,
+            &cwd,
+            "hp-demo-coordinator",
+            "idle",
+        ),
+        stale
+    );
+    world
+        .runner
+        .on("agent prompt", ok(r#"{"result":{"ok":true}}"#));
+    let delivery = coordinator::prompt_confirmed(&world.ctx(), "demo", "look here").unwrap();
+    assert_eq!(delivery, coordinator::PromptDelivery::Confirmed);
+    let calls = world.runner.calls.borrow();
+    let prompt = calls
+        .iter()
+        .find(|cmd| cmd.display().contains("agent prompt"))
+        .unwrap();
+    assert!(
+        prompt.display().contains(&record.pane_id),
+        "{}",
+        prompt.display()
+    );
+    assert!(!prompt.display().contains("w9:p9"), "{}", prompt.display());
+}
+
+#[test]
+fn contract_the_screen_prompts_the_bound_pane() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let record = project.coordinator().unwrap();
+    show_coordinator(&world, &project, "idle");
+    world
+        .runner
+        .on("agent prompt", ok(r#"{"result":{"ok":true}}"#));
+    let request = crate::screen::jobs::Request {
+        command: crate::screen::state::Command::SubmitPrompt,
+        slug: "demo".into(),
+        text: "look here".into(),
+        project_id: "prj_bound".into(),
+        intent: "prompt".into(),
+        ..Default::default()
+    };
+    let outcome = crate::screen::jobs::perform(&world.ctx(), &request);
+    assert_eq!(outcome.status, "confirmed");
+    assert_eq!(outcome.project_id, "prj_bound");
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    let calls = world.runner.calls.borrow();
+    let prompt = calls
+        .iter()
+        .find(|cmd| cmd.display().contains("agent prompt"))
+        .unwrap();
+    assert!(prompt.display().contains("--wait"), "{}", prompt.display());
+    assert!(
+        prompt.display().contains(&record.pane_id),
+        "{}",
+        prompt.display()
+    );
+    assert!(!prompt.display().contains("w9:p9"), "{}", prompt.display());
+}
+
+#[test]
+fn contract_screen_open_does_not_start_in_this_pane() {
+    let options = coordinator::screen_open_options();
+    assert!(!options.here);
+    assert!(!options.new);
+    assert!(!options.rebind);
+    assert!(options.profile.is_none());
 }

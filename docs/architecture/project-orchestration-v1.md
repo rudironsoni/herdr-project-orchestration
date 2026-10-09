@@ -91,17 +91,17 @@ Milestone 3 moves harness flag tables behind one adapter. The coordinator still 
 
 ## 10. TUI
 
-`prefix+a` opens one full screen. The action id is `herdr-projects.open-popup`. `P` and `/` open the project picker.
+`prefix+a` opens the projects screen. The action id stays `herdr-projects.open-popup`. `herdr-projects popup` opens that screen. `herdr-projects popup --classic` opens the previous screen. The previous screen stays until its actions have replacements.
 
-The screen opens on Overview. `g` then `1` through `9` selects Overview, Needs you, Work, Places, Reviews, Tasks, Inbox, Automation, and More. `1` through `9` on a thread row still run Next.
+At 160 columns and above the screen shows Projects, current work, and Overview. From 100 to 159 columns it shows current work and Overview, and `P` opens Projects. From 80 to 99 columns it shows one of those two regions. Below 80 columns it says the terminal is too small.
 
-Needs you lists threads whose group is Waiting on you, except a failed thread. A failed thread is a Work row and its word is failed. Reviews lists Ready for review and Landing. A pull request is a string on the thread. Inbox rows and task lines are not copied into Needs you.
+Projects lists New Project, All Projects, Needs you, Inbox, and each project. Selecting a project changes the current project. It does not open a tab. Needs you is threads in Waiting on you, except failed threads. Inbox is a separate count.
 
-Places reads repository rows and workspace rows. A workspace with `repository_id` set is under that repository. A workspace with `repository_id` null is under the heading Project directory. A thread is not a Places row.
+Overview tabs are Threads, Tasks, Library, PRs, Routines, and Resources. `g` then `1` through `6` selects one. A thread's detail stays in Overview. The center shows the goal, the coordinator record, current threads, recorded reports, and prompts sent from this screen. It does not show an agent transcript or invent a reply.
 
-Archive is `A` on Settings. Settings and Memory are under More. Esc goes back one level and closes the screen at the root. `\` hides the project list when the width is at least 120. Below 120 columns the screen is one pane and the breadcrumb is first. `l` shows the inspector in place of the list, and Esc returns to the list. At 120 and above, the project list, the body, and the inspector are visible. At 160 the Places body can split repository and workspace. The inspector shows the selected row. It does not show the agent transcript.
+`o` opens the selected worker in Herdr. Enter runs the selected action. Esc goes back one level. Tab and Shift-Tab move focus. `?` opens help. `/` filters the project list by name or slug. Esc clears that filter before it closes the list. `S` runs sweep's dry run, then asks before it removes anything. `y` copies the selected file path. On Threads, `a` acknowledges, `s` stops, `r` restarts, `x` resolves, `t` starts a thread, and `1` through `9` send that Next line. On Tasks, `d` delegates, `c` completes, and `x` drops. `m` opens the project menu: goal, profiles, safety, yolo, pause, archive, delete, unarchive, and rename. Safety lists the six project safety settings and writes the chosen value in place. Turning yolo on asks first. The other safety values apply on Enter. Argument settings use the text field. On Routines, `i` shows that routine's prompt, and Enter toggles it. Archive, delete, unarchive, rename, resolve, sweep, and turning yolo on ask first.
 
-`t` on Work runs `thread start` for worktree, tab, or checkout, and `thread adopt` for adopted.
+A PR row is a recorded string. It is not proof that a pull request is open or passing checks. Adopted threads use `thread adopt`. Tab and checkout threads do not create a worktree.
 
 ## 11. Configuration
 
@@ -113,7 +113,7 @@ Archive sets lifecycle to `archived` and keeps files and rows. Delete moves the 
 
 ## 13. Recovery
 
-`create_project`, `rename_project`, and `delete_project` record an operation before the filesystem effect. `open_coordinator` records its intent, including whether a new workspace is required, before Herdr creates a workspace, a tab, or an agent. A retry reuses that workspace and tab. `coordinator adopt` records the session with the environment id of the named machine. Archive is one SQLite transaction and does not move files, so it has no filesystem recovery step. A pending create with no directory resumes. A done project whose directory disappears becomes `missing` and is not recreated. A session whose terminal id changed is stale. Routing does not select another pane.
+`create_project`, `rename_project`, and `delete_project` record an operation before the filesystem effect. `open_coordinator` records its intent, including whether a new workspace is required, before Herdr creates a workspace, a tab, or an agent. A retry reuses that workspace and tab. `coordinator adopt` records the session with the environment id of the named machine. Archive is one SQLite transaction and does not move files, so it has no filesystem recovery step. A pending create with no directory resumes. A done project whose directory disappears becomes `missing` and is not recreated. A session whose terminal id changed is stale. Routing does not select another pane. A worktree thread start records the thread id before Herdr creates the worktree. If that path is not stored, recovery does not attach a directory just because the expected branch exists. It keeps the thread and reports an unresolved recovery. A retry of the same title does not allocate another thread.
 
 ## 14. Authority
 

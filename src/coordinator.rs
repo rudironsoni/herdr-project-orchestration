@@ -851,6 +851,104 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
 /// `coordinator prompt`: a sentence to a coordinator (the popup's task keys
 /// use it; the coordinator stays the only writer of TASKS.md).
 pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
+    let ready = prompt_target(ctx, slug, text)?;
+    let status = ready
+        .view
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == ready.pane_id)
+        .map(|agent| agent.agent_status.clone())
+        .unwrap_or_default();
+    ready
+        .view
+        .herdr
+        .agent_prompt(&ready.pane_id, &ready.text)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "sent to the coordinator in pane {} (agent was {})",
+        ready.pane_id, status
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptDelivery {
+    Confirmed,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptField {
+    Draft,
+    Submitting,
+    Confirmed,
+    Refused,
+    Uncertain,
+}
+
+pub fn prompt_confirmed(ctx: &Ctx, slug: &str, text: &str) -> Result<PromptDelivery> {
+    let ready = prompt_target(ctx, slug, text)?;
+    match ready
+        .view
+        .herdr
+        .agent_prompt_confirmed(&ready.pane_id, &ready.text)
+    {
+        Ok(()) => Ok(PromptDelivery::Confirmed),
+        Err(error) => match error.code.as_str() {
+            "agent_prompt_stalled" | "timeout" | "no_reply" => Ok(PromptDelivery::Uncertain),
+            _ => Err(anyhow::anyhow!("{error}")),
+        },
+    }
+}
+
+pub fn prompt_field(delivery: &Result<PromptDelivery>) -> PromptField {
+    match delivery {
+        Ok(PromptDelivery::Confirmed) => PromptField::Confirmed,
+        Ok(PromptDelivery::Uncertain) => PromptField::Uncertain,
+        Err(_) => PromptField::Refused,
+    }
+}
+
+pub fn prompt_field_after_open_tab() -> PromptField {
+    PromptField::Draft
+}
+
+pub fn begin_prompt_submit(field: PromptField) -> Option<PromptField> {
+    match field {
+        PromptField::Draft | PromptField::Refused => Some(PromptField::Submitting),
+        PromptField::Submitting | PromptField::Confirmed | PromptField::Uncertain => None,
+    }
+}
+
+pub fn note_prompt_edit(field: PromptField) -> PromptField {
+    match field {
+        PromptField::Submitting => field,
+        PromptField::Draft
+        | PromptField::Confirmed
+        | PromptField::Refused
+        | PromptField::Uncertain => PromptField::Draft,
+    }
+}
+
+/// `open` from the screen starts a tab. It does not run Claude in the screen pane,
+/// and a successful open is not a readiness result.
+pub fn screen_open_options() -> OpenOptions {
+    OpenOptions {
+        session: crate::paths::SessionFlags::default(),
+        rebind: false,
+        profile: None,
+        new: false,
+        here: false,
+    }
+}
+
+struct ReadyPrompt<'a> {
+    view: crate::threads::SessionView<'a>,
+    pane_id: String,
+    text: String,
+}
+
+fn prompt_target<'a>(ctx: &'a Ctx, slug: &str, text: &str) -> Result<ReadyPrompt<'a>> {
     let project = Project::load(&ctx.root, slug)?;
     let text = text.trim();
     if text.is_empty() {
@@ -863,22 +961,19 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
     let target = view
         .agents
         .iter()
-        .filter(|a| is_coordinator(&record, a))
-        .filter(|a| a.agent_status != "blocked" && a.agent_status != "unknown")
-        .max_by_key(|a| a.state_change_seq)
+        .filter(|agent| is_coordinator(&record, agent))
+        .filter(|agent| agent.agent_status != "blocked" && agent.agent_status != "unknown")
+        .max_by_key(|agent| agent.state_change_seq)
         .with_context(|| {
             format!(
                 "no coordinator of `{slug}` can take a prompt right now; `open {slug}` starts one"
             )
         })?;
-    view.herdr
-        .agent_prompt(&target.pane_id, text)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!(
-        "sent to the coordinator in pane {} (agent was {})",
-        target.pane_id, target.agent_status
-    );
-    Ok(())
+    Ok(ReadyPrompt {
+        pane_id: target.pane_id.clone(),
+        text: text.to_string(),
+        view,
+    })
 }
 
 pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {

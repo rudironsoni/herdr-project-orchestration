@@ -30,6 +30,7 @@ mod runner;
 mod safety;
 #[cfg(test)]
 mod scenarios;
+mod screen;
 mod settings;
 mod setup;
 mod sidebar;

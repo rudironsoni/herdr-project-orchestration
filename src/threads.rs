@@ -177,6 +177,9 @@ pub fn placement(kind: Option<Kind>, has_repo: bool, remote: bool) -> Result<Kin
 /// returns. The agent is launched by the ticker, so there is one delivery path.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
+    if let Some(existing) = pending_thread_start(&project, &args.title)? {
+        return Err(existing.into());
+    }
     let status = project.status();
     if status != project::Status::Active {
         bail!("`{slug}` is {status}; `thread start` is refused until it is active again");
@@ -269,8 +272,13 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         project::write_atomic(&thread::task_path(&project, &id), args.task.as_bytes())?;
     }
 
+    let recorded = begin_thread_start(&project, &id)?;
     match place_and_brief(ctx, &project, &view, &id, false) {
-        Ok(thread) => Ok(thread),
+        Ok(thread) => {
+            let (store, _) = project.open_row()?;
+            store.finish_operation(&recorded.operation_id, "done", "")?;
+            Ok(thread)
+        }
         Err(error) => {
             // Nothing is cleaned up automatically; `thread restart` retries.
             let message = format!("{error:#}");
@@ -278,11 +286,220 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
                 t.status = Status::Failed;
                 t.error = message.clone();
             });
-            Err(error.context(format!(
-                "thread {id} failed to start; `thread restart {slug} {id}` retries"
-            )))
+            if let Ok((store, _)) = project.open_row() {
+                let _ = store.finish_operation(&recorded.operation_id, "failed", &message);
+            }
+            Err(ProvisionFailed {
+                slug: slug.to_string(),
+                id,
+                operation_id: recorded.operation_id,
+                status: Status::Failed,
+                source: error,
+            }
+            .into())
         }
     }
+}
+
+#[derive(Debug)]
+pub struct ProvisionFailed {
+    pub slug: String,
+    pub id: String,
+    pub operation_id: String,
+    pub status: Status,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for ProvisionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "thread {} failed to start; `thread restart {} {}` retries: {:#}",
+            self.id, self.slug, self.id, self.source
+        )
+    }
+}
+
+impl std::error::Error for ProvisionFailed {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadOperation {
+    pub operation_id: String,
+    pub project_id: String,
+    pub target_id: Option<String>,
+    pub intent: String,
+    pub status: String,
+    pub result: String,
+}
+
+#[derive(Debug)]
+pub struct StartForm {
+    pub id: Option<String>,
+    pub status: Option<Status>,
+    pub operation_id: Option<String>,
+    pub error: Option<String>,
+}
+
+pub fn form_after_start(result: Result<Thread>) -> StartForm {
+    match result {
+        Ok(thread) => StartForm {
+            id: Some(thread.id),
+            status: Some(thread.status),
+            operation_id: None,
+            error: None,
+        },
+        Err(error) => match error.downcast::<ProvisionFailed>() {
+            Ok(failed) => StartForm {
+                id: Some(failed.id),
+                status: Some(failed.status),
+                operation_id: Some(failed.operation_id),
+                error: Some(failed.source.to_string()),
+            },
+            Err(error) => StartForm {
+                id: None,
+                status: None,
+                operation_id: None,
+                error: Some(error.to_string()),
+            },
+        },
+    }
+}
+
+pub fn repeat_start_refused(form: &StartForm) -> bool {
+    form.id.is_some()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartRecovery {
+    None,
+    Recorded {
+        id: String,
+        operation_id: String,
+    },
+    Unresolved {
+        id: String,
+        operation_id: String,
+        reason: String,
+    },
+}
+
+pub fn recover_start(project: &Project) -> Result<StartRecovery> {
+    let Some(op) = current_thread_start(project)? else {
+        return Ok(StartRecovery::None);
+    };
+    if op.status == "done" || op.target_id.is_none() {
+        return Ok(StartRecovery::None);
+    }
+    let id = op.target_id.unwrap_or_default();
+    let Ok(thread) = thread::load(project, &id) else {
+        return Ok(StartRecovery::Unresolved {
+            id,
+            operation_id: op.operation_id,
+            reason: "the thread record is missing; nothing was attached".into(),
+        });
+    };
+    if thread.kind == Kind::Worktree && thread.worktree_path.is_empty() {
+        return Ok(StartRecovery::Unresolved {
+            id,
+            operation_id: op.operation_id,
+            reason:
+                "worktree identifiers were not stored; the thread was kept and nothing was attached"
+                    .into(),
+        });
+    }
+    if !thread.worktree_path.is_empty() && !Path::new(&thread.worktree_path).is_dir() {
+        return Ok(StartRecovery::Unresolved {
+            id,
+            operation_id: op.operation_id,
+            reason: "the recorded worktree path is not a directory; nothing new was created".into(),
+        });
+    }
+    Ok(StartRecovery::Recorded {
+        id,
+        operation_id: op.operation_id,
+    })
+}
+
+pub fn begin_thread_start(project: &Project, id: &str) -> Result<ThreadOperation> {
+    let (store, row) = project.open_row()?;
+    let payload = serde_json::json!({
+        "target_id": id,
+        "intent": "thread_start",
+    })
+    .to_string();
+    let key = format!("thread_start:{}:{id}", row.id);
+    let (operation_id, _) = store.begin_operation(&row.id, "thread_start", &payload, &key)?;
+    let op = store.operation(&operation_id)?;
+    thread_operation(&store, &op)
+}
+
+pub fn current_thread_start(project: &Project) -> Result<Option<ThreadOperation>> {
+    let (store, row) = project.open_row()?;
+    if let Some(op) = store
+        .list_pending()?
+        .into_iter()
+        .find(|op| op.project_id == row.id && op.kind == "thread_start")
+    {
+        return Ok(Some(thread_operation(&store, &op)?));
+    }
+    let Some(op) = store.latest_kind(&row.id, "thread_start")? else {
+        return Ok(None);
+    };
+    Ok(Some(thread_operation(&store, &op)?))
+}
+
+fn pending_thread_start(project: &Project, title: &str) -> Result<Option<ProvisionFailed>> {
+    let (store, row) = project.open_row()?;
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    for op in store.list_pending()? {
+        if op.project_id != row.id || op.kind != "thread_start" {
+            continue;
+        }
+        let recorded = thread_operation(&store, &op)?;
+        let Some(id) = recorded.target_id.filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let Ok(thread) = thread::load(project, &id) else {
+            continue;
+        };
+        if thread.title.trim() != title {
+            continue;
+        }
+        return Ok(Some(ProvisionFailed {
+            slug: project.slug.clone(),
+            id,
+            operation_id: recorded.operation_id,
+            status: thread.status,
+            source: anyhow::anyhow!("a thread start is already recorded"),
+        }));
+    }
+    Ok(None)
+}
+
+fn thread_operation(
+    store: &crate::store::Store,
+    op: &crate::store::OperationRow,
+) -> Result<ThreadOperation> {
+    let value: serde_json::Value =
+        serde_json::from_str(&op.payload).unwrap_or_else(|_| serde_json::json!({}));
+    Ok(ThreadOperation {
+        operation_id: op.id.clone(),
+        project_id: op.project_id.clone(),
+        target_id: value
+            .get("target_id")
+            .and_then(|item| item.as_str())
+            .map(str::to_string),
+        intent: value
+            .get("intent")
+            .and_then(|item| item.as_str())
+            .unwrap_or("thread_start")
+            .to_string(),
+        status: op.status.clone(),
+        result: store.operation_error(&op.id).unwrap_or_default(),
+    })
 }
 
 /// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).

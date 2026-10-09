@@ -736,6 +736,58 @@ pub fn list_slugs(root: &Path) -> Vec<String> {
     slugs
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedProject {
+    pub slug: String,
+    pub display_name: String,
+}
+
+pub fn resolve_open_name(projects: &[NamedProject], query: &str) -> Result<String> {
+    if validate_slug(query).is_ok() && projects.iter().any(|project| project.slug == query) {
+        return Ok(query.to_string());
+    }
+    let mut matches = projects
+        .iter()
+        .filter(|project| project.display_name == query);
+    let Some(first) = matches.next() else {
+        bail!("no project matches `{query}`");
+    };
+    if matches.next().is_some() {
+        bail!("`{query}` matches more than one project");
+    }
+    Ok(first.slug.clone())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectIndex {
+    pub projects: Vec<crate::store::ProjectRow>,
+    pub failed_imports: Vec<(String, String)>,
+}
+
+pub fn import_and_list(root: &Path) -> Result<ProjectIndex> {
+    let store = Store::open(root)?;
+    for slug in list_slugs(root) {
+        let project = Project::load(root, &slug)?;
+        if let Err(error) = project.open_row() {
+            let directory = project.canonical_dir().to_string_lossy().into_owned();
+            let known = store.project_by_slug(&slug)?.is_some();
+            let status = store.import_status(&directory)?;
+            if !known && status.as_deref() != Some("failed") {
+                store.note_import(&directory, "failed", &error.to_string(), None)?;
+            }
+        }
+    }
+    for row in store.list_projects()? {
+        if !Path::new(&row.directory).join("PROJECT.md").is_file() {
+            let _ = Project::load(root, &row.slug);
+        }
+    }
+    Ok(ProjectIndex {
+        projects: store.list_projects()?,
+        failed_imports: store.failed_imports()?,
+    })
+}
+
 /// `PATH[@MACHINE]` as given to `new --repo`.
 pub fn parse_repo_arg(arg: &str) -> Repo {
     if let Some((path, machine)) = arg.rsplit_once('@') {
@@ -962,6 +1014,199 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
         Store::open(&root)?.finish_operation(&operation.id, "done", "")?;
     }
     Ok(project)
+}
+
+pub struct NewProject {
+    pub name: String,
+    pub goal: String,
+    pub repos: Vec<Repo>,
+    pub thread_profile: String,
+    pub coordinator_profile: String,
+    pub prefix: String,
+}
+
+pub fn create_with_setup(root: &Path, spec: &NewProject) -> Result<Project> {
+    let project = create(root, &spec.name, &spec.goal, spec.repos.clone())?;
+    begin_setup(&project, &spec.thread_profile, &spec.coordinator_profile)?;
+    finish_setup(&project, &spec.prefix)
+        .with_context(|| format!("`{}` was created; setup is incomplete", project.slug))?;
+    Ok(project)
+}
+
+fn begin_setup(project: &Project, thread: &str, coordinator: &str) -> Result<()> {
+    let (store, row) = project.open_row()?;
+    if store.latest_kind(&row.id, "write_defaults")?.is_none() {
+        let payload = serde_json::json!({
+            "intent": "write_defaults",
+            "thread_profile": thread,
+            "coordinator_profile": coordinator,
+        })
+        .to_string();
+        store.start_intent(&row.id, "write_defaults", &payload)?;
+    }
+    if store.latest_kind(&row.id, "write_priming")?.is_none() {
+        store.start_intent(&row.id, "write_priming", r#"{"intent":"write_priming"}"#)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct SetupIntervention {
+    pub path: String,
+}
+
+impl std::fmt::Display for SetupIntervention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "setup is incomplete: {} was changed; Finish setup will not overwrite it",
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for SetupIntervention {}
+
+pub fn finish_setup(project: &Project, prefix: &str) -> Result<()> {
+    let (store, row) = project.open_row()?;
+    if let Some(op) = store.latest_kind(&row.id, "write_defaults")?
+        && op.status != "done"
+    {
+        reconcile_defaults(&store, project, &op)?;
+    }
+    if let Some(op) = store.latest_kind(&row.id, "write_priming")? {
+        if op.status != "done" {
+            reconcile_priming(&store, project, &op, prefix)?;
+        }
+    } else if !project.dir().join("AGENTS.md").exists() {
+        write_priming(project, prefix)?;
+    }
+    Ok(())
+}
+
+fn reconcile_defaults(
+    store: &Store,
+    project: &Project,
+    op: &crate::store::OperationRow,
+) -> Result<()> {
+    let value: serde_json::Value =
+        serde_json::from_str(&op.payload).context("write_defaults payload does not parse")?;
+    let thread = value["thread_profile"].as_str().unwrap_or("claude");
+    let coordinator = value["coordinator_profile"].as_str().unwrap_or("claude");
+    let (settings, _) = project.read_project_md()?;
+    let matches = settings.thread_profile == thread && settings.coordinator_profile == coordinator;
+    if matches {
+        store.finish_operation(&op.id, "done", "")?;
+        return Ok(());
+    }
+    let skeleton = settings.thread_profile == Settings::default().thread_profile
+        && settings.coordinator_profile == Settings::default().coordinator_profile;
+    let text = std::fs::read_to_string(project.project_md()).unwrap_or_default();
+    let keys_missing = !profile_keys_present(&text);
+    if skeleton || keys_missing {
+        crate::profiles::write_project_defaults(project, thread, coordinator)?;
+        store.finish_operation(&op.id, "done", "")?;
+        return Ok(());
+    }
+    Err(SetupIntervention {
+        path: "PROJECT.md".into(),
+    }
+    .into())
+}
+
+fn reconcile_priming(
+    store: &Store,
+    project: &Project,
+    op: &crate::store::OperationRow,
+    prefix: &str,
+) -> Result<()> {
+    let (settings, _) = project.read_project_md()?;
+    let name = display_name(&settings.name, &project.slug);
+    let expected = agents_md(&name, &project.slug, prefix);
+    let path = project.dir().join("AGENTS.md");
+    match std::fs::read_to_string(&path) {
+        Err(_) if !path.exists() => {
+            write_priming(project, prefix)?;
+            store.finish_operation(&op.id, "done", "")?;
+            Ok(())
+        }
+        Ok(text) if text == expected => {
+            if claude_blocks(project) {
+                return Err(SetupIntervention {
+                    path: "CLAUDE.md".into(),
+                }
+                .into());
+            }
+            ensure_missing_priming_links(project)?;
+            store.finish_operation(&op.id, "done", "")?;
+            Ok(())
+        }
+        Ok(text) if !text.contains("Written by herdr-projects") => {
+            write_priming(project, prefix)?;
+            store.finish_operation(&op.id, "done", "")?;
+            Ok(())
+        }
+        _ => Err(SetupIntervention {
+            path: "AGENTS.md".into(),
+        }
+        .into()),
+    }
+}
+
+fn claude_blocks(project: &Project) -> bool {
+    let path = project.dir().join("CLAUDE.md");
+    match std::fs::symlink_metadata(&path) {
+        Err(_) => false,
+        Ok(meta) => {
+            if !meta.file_type().is_symlink() {
+                return true;
+            }
+            std::fs::read_link(&path).ok().as_deref() != Some(std::path::Path::new("AGENTS.md"))
+        }
+    }
+}
+
+fn ensure_missing_priming_links(project: &Project) -> Result<()> {
+    let dir = project.dir();
+    let claude = dir.join("CLAUDE.md");
+    if !claude.exists() && std::fs::symlink_metadata(&claude).is_err() {
+        std::os::unix::fs::symlink("AGENTS.md", &claude)?;
+    }
+    if !dir.join("uploads").exists() {
+        std::fs::create_dir(dir.join("uploads"))?;
+    }
+    write_default_routine(project)?;
+    Ok(())
+}
+
+fn profile_keys_present(text: &str) -> bool {
+    let Some(front) = text.strip_prefix("+++\n").and_then(|rest| {
+        rest.split_once("\n+++\n")
+            .map(|(front, _)| front)
+            .or_else(|| rest.strip_suffix("\n+++"))
+    }) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(front) else {
+        return false;
+    };
+    let Some(table) = value.as_table() else {
+        return false;
+    };
+    (table.contains_key("thread_profile") || table.contains_key("thread_agent"))
+        && (table.contains_key("coordinator_profile") || table.contains_key("coordinator_agent"))
+}
+
+pub fn setup_incomplete(project: &Project) -> Result<bool> {
+    let (store, row) = project.open_row()?;
+    for kind in ["write_defaults", "write_priming"] {
+        if let Some(op) = store.latest_kind(&row.id, kind)?
+            && op.status != "done"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn write_created_files(project: &Project, settings: &Settings) -> Result<()> {
@@ -1696,5 +1941,202 @@ mod tests {
                 .flatten()
                 .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
         );
+    }
+
+    fn project_md(name: &str) -> String {
+        format!("+++\nname = \"{name}\"\n+++\n\n")
+    }
+
+    #[test]
+    fn contract_legacy_import_lists_unimported_and_failed_directories() {
+        let root = tempfile::tempdir().unwrap();
+        create(root.path(), "alpha", "", vec![]).unwrap();
+        let beta = root.path().join("beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(beta.join("PROJECT.md"), project_md("Beta")).unwrap();
+        let gamma = root.path().join("gamma");
+        std::fs::create_dir_all(gamma.join(".state")).unwrap();
+        std::fs::write(gamma.join("PROJECT.md"), project_md("Gamma")).unwrap();
+        std::fs::write(gamma.join(".state").join("project.json"), "not json").unwrap();
+
+        let index = import_and_list(root.path()).unwrap();
+        let slugs: Vec<_> = index.projects.iter().map(|row| row.slug.as_str()).collect();
+        assert_eq!(slugs, ["alpha", "beta"]);
+        assert!(index.projects.iter().all(|row| row.id.starts_with("prj_")));
+        assert_eq!(index.failed_imports.len(), 1);
+        assert!(index.failed_imports[0].1.contains("does not parse"));
+        assert!(
+            Path::new(&index.failed_imports[0].0)
+                .file_name()
+                .is_some_and(|name| name == "gamma")
+        );
+
+        let again = import_and_list(root.path()).unwrap();
+        assert_eq!(again.projects.len(), 2);
+        assert_eq!(again.failed_imports.len(), 1);
+    }
+
+    #[test]
+    fn contract_a_missing_project_folder_stays_listed() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "delta", "", vec![]).unwrap();
+        std::fs::remove_file(project.project_md()).unwrap();
+        let index = import_and_list(root.path()).unwrap();
+        let row = index
+            .projects
+            .iter()
+            .find(|row| row.slug == "delta")
+            .unwrap();
+        assert_eq!(row.availability, "missing");
+    }
+
+    #[test]
+    fn contract_open_name_prefers_an_existing_slug() {
+        let projects = vec![
+            NamedProject {
+                slug: "horca".into(),
+                display_name: "Horca".into(),
+            },
+            NamedProject {
+                slug: "other".into(),
+                display_name: "horca".into(),
+            },
+            NamedProject {
+                slug: "twin-a".into(),
+                display_name: "Same".into(),
+            },
+            NamedProject {
+                slug: "twin-b".into(),
+                display_name: "Same".into(),
+            },
+        ];
+        assert_eq!(resolve_open_name(&projects, "horca").unwrap(), "horca");
+        assert_eq!(resolve_open_name(&projects, "Horca").unwrap(), "horca");
+        assert!(resolve_open_name(&projects, "Same").is_err());
+        assert!(resolve_open_name(&projects, "missing").is_err());
+    }
+
+    fn spec(name: &str, repos: Vec<Repo>) -> NewProject {
+        NewProject {
+            name: name.into(),
+            goal: "Ship".into(),
+            repos,
+            thread_profile: "claude".into(),
+            coordinator_profile: "luna".into(),
+            prefix: "hp --root /tmp".into(),
+        }
+    }
+
+    #[test]
+    fn contract_create_rejects_a_duplicate_and_keeps_one_project() {
+        let root = tempfile::tempdir().unwrap();
+        let before = import_and_list(root.path()).unwrap();
+        assert!(before.projects.is_empty());
+        create_with_setup(root.path(), &spec("Demo", vec![])).unwrap();
+        let error = create_with_setup(root.path(), &spec("Demo", vec![])).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(import_and_list(root.path()).unwrap().projects.len(), 1);
+    }
+
+    #[test]
+    fn contract_create_stores_one_or_many_repositories() {
+        let root = tempfile::tempdir().unwrap();
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        let project = create_with_setup(
+            root.path(),
+            &spec(
+                "Demo",
+                vec![
+                    Repo {
+                        path: one.path().display().to_string(),
+                        machine: None,
+                    },
+                    Repo {
+                        path: two.path().display().to_string(),
+                        machine: None,
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+        let (settings, _) = project.read_project_md().unwrap();
+        assert_eq!(settings.repos.len(), 2);
+        assert_eq!(settings.coordinator_profile, "luna");
+        assert!(project.dir().join("AGENTS.md").is_file());
+        assert!(!setup_incomplete(&project).unwrap());
+    }
+
+    #[test]
+    fn contract_finish_setup_keeps_a_changed_agents_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "Ship", vec![]).unwrap();
+        begin_setup(&project, "claude", "luna").unwrap();
+        let (settings, _) = project.read_project_md().unwrap();
+        let expected = agents_md(
+            &display_name(&settings.name, &project.slug),
+            &project.slug,
+            "hp --root /tmp",
+        );
+        let edited = expected.replace(
+            "Written by herdr-projects",
+            "Written by herdr-projects. user note",
+        );
+        std::fs::write(project.dir().join("AGENTS.md"), &edited).unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        let intervention = error.downcast::<SetupIntervention>().unwrap();
+        assert_eq!(intervention.path, "AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap(),
+            edited
+        );
+        assert!(setup_incomplete(&project).unwrap());
+        assert_eq!(import_and_list(root.path()).unwrap().projects.len(), 1);
+        let kept = std::fs::read_to_string(project.project_md()).unwrap();
+        std::fs::write(project.project_md(), kept.replace("Ship", "keep me")).unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        assert!(error.downcast::<SetupIntervention>().is_ok());
+        assert!(
+            std::fs::read_to_string(project.project_md())
+                .unwrap()
+                .contains("keep me")
+        );
+        assert_eq!(import_and_list(root.path()).unwrap().projects.len(), 1);
+    }
+
+    #[test]
+    fn contract_finish_setup_keeps_a_regular_claude_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "Ship", vec![]).unwrap();
+        begin_setup(&project, "claude", "luna").unwrap();
+        let (settings, _) = project.read_project_md().unwrap();
+        let expected = agents_md(
+            &display_name(&settings.name, &project.slug),
+            &project.slug,
+            "hp --root /tmp",
+        );
+        std::fs::write(project.dir().join("AGENTS.md"), &expected).unwrap();
+        let claude = project.dir().join("CLAUDE.md");
+        std::fs::write(&claude, "user notes").unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        let intervention = error.downcast::<SetupIntervention>().unwrap();
+        assert_eq!(intervention.path, "CLAUDE.md");
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), "user notes");
+        assert_eq!(
+            std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn contract_a_finished_setup_step_is_not_rewritten() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create_with_setup(root.path(), &spec("Demo", vec![])).unwrap();
+        let path = project.dir().join("AGENTS.md");
+        let edited = format!("{}\nuser note\n", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, &edited).unwrap();
+        finish_setup(&project, "hp --root /tmp").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(!setup_incomplete(&project).unwrap());
     }
 }

@@ -571,6 +571,15 @@ impl Store {
             .with_context(|| format!("no project {id}"))
     }
 
+    pub fn list_projects(&self) -> Result<Vec<ProjectRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, slug, pending_slug, lifecycle, availability, primary_session_id, directory
+             FROM projects WHERE lifecycle != 'deleted' ORDER BY slug",
+        )?;
+        let rows = stmt.query_map([], read_project)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn set_directory(&self, id: &str, directory: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE projects SET directory = ?1, updated_at = ?2 WHERE id = ?3",
@@ -1120,6 +1129,37 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn operation(&self, id: &str) -> Result<OperationRow> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, kind, payload, step, status, idempotency_key FROM operations WHERE id = ?1",
+                [id],
+                read_operation,
+            )
+            .with_context(|| format!("no operation {id}"))
+    }
+
+    pub fn latest_kind(&self, project_id: &str, kind: &str) -> Result<Option<OperationRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, kind, payload, step, status, idempotency_key
+                 FROM operations WHERE project_id = ?1 AND kind = ?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![project_id, kind],
+                read_operation,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn operation_error(&self, id: &str) -> Result<String> {
+        self.conn
+            .query_row("SELECT error FROM operations WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .with_context(|| format!("no operation {id}"))
     }
 
     pub fn list_pending(&self) -> Result<Vec<OperationRow>> {

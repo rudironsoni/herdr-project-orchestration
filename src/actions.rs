@@ -268,11 +268,7 @@ pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
     let handoff = read_handoff(ctx);
     let result = match id {
         "projects" => {
-            return crate::popup::run(
-                ctx,
-                Some(handoff.slug.clone()).filter(|s| !s.is_empty()),
-                handoff.workspace_id.clone(),
-            );
+            return crate::screen::run(ctx, Some(handoff.slug.clone()).filter(|s| !s.is_empty()));
         }
         "overview" => {
             return overview::run(
@@ -288,7 +284,20 @@ pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
                 bail!("no name given");
             }
             let goal = ask("Goal (one line, optional)", "")?;
-            let project = project::create(&ctx.root, &name, &goal, Vec::new())?;
+            let config = crate::profiles::load(&ctx.config_dir)?;
+            let prefix = coordinator::current_prefix(&ctx.root)?;
+            let project = project::create_with_setup(
+                &ctx.root,
+                &project::NewProject {
+                    name,
+                    goal,
+                    repos: Vec::new(),
+                    thread_profile: config.new_project_default(crate::profiles::Role::Thread),
+                    coordinator_profile: config
+                        .new_project_default(crate::profiles::Role::Coordinator),
+                    prefix,
+                },
+            )?;
             println!("created `{}` at {}", project.slug, project.dir().display());
             run_on_slug(ctx, "open", &project.slug)
         })(),
