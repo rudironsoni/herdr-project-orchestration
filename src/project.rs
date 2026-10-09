@@ -1079,6 +1079,12 @@ pub fn finish_setup(project: &Project, prefix: &str) -> Result<()> {
             reconcile_priming(&store, project, &op, prefix)?;
         }
     } else if !project.dir().join("AGENTS.md").exists() {
+        if claude_blocks(project) {
+            return Err(SetupIntervention {
+                path: "CLAUDE.md".into(),
+            }
+            .into());
+        }
         write_priming(project, prefix)?;
     }
     Ok(())
@@ -1126,6 +1132,12 @@ fn reconcile_priming(
     let path = project.dir().join("AGENTS.md");
     match std::fs::read_to_string(&path) {
         Err(_) if !path.exists() => {
+            if claude_blocks(project) {
+                return Err(SetupIntervention {
+                    path: "CLAUDE.md".into(),
+                }
+                .into());
+            }
             write_priming(project, prefix)?;
             store.finish_operation(&op.id, "done", "")?;
             Ok(())
@@ -2149,6 +2161,29 @@ mod tests {
                 .join("AGENTS.md.before-herdr-projects")
                 .exists()
         );
+        assert!(
+            !project
+                .dir()
+                .join("CLAUDE.md.before-herdr-projects")
+                .exists()
+        );
+        assert!(setup_incomplete(&project).unwrap());
+    }
+
+    #[test]
+    fn contract_finish_setup_keeps_a_user_claude_file_when_agents_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "Ship", vec![]).unwrap();
+        begin_setup(&project, "claude", "claude").unwrap();
+        let agents = project.dir().join("AGENTS.md");
+        let claude = project.dir().join("CLAUDE.md");
+        let text = "user claude notes\n";
+        std::fs::write(&claude, text).unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        let intervention = error.downcast::<SetupIntervention>().unwrap();
+        assert_eq!(intervention.path, "CLAUDE.md");
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), text);
+        assert!(!agents.exists());
         assert!(
             !project
                 .dir()
