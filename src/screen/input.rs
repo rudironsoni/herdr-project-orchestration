@@ -55,16 +55,16 @@ pub fn key_command(
         KeyCode::Char('/') => Command::StartFilter,
         KeyCode::Char('S') => Command::SweepPreview,
         KeyCode::Char('y') => copy_command(app, snap),
-        KeyCode::Char('a') if threads_tab(app, snap) => Command::Ack,
-        KeyCode::Char('s') if threads_tab(app, snap) => Command::Stop,
-        KeyCode::Char('r') if threads_tab(app, snap) => Command::Restart,
-        KeyCode::Char('x') if threads_tab(app, snap) => Command::Resolve,
+        KeyCode::Char('a') if on_thread(app, snap) => Command::Ack,
+        KeyCode::Char('s') if on_thread(app, snap) => Command::Stop,
+        KeyCode::Char('r') if on_thread(app, snap) => Command::Restart,
+        KeyCode::Char('x') if on_thread(app, snap) => Command::Resolve,
         KeyCode::Char('t') if threads_tab(app, snap) => Command::StartThreadForm,
         KeyCode::Char('d') if tasks_tab(app, snap) => Command::Delegate,
         KeyCode::Char('c') if tasks_tab(app, snap) => Command::CompleteTask,
         KeyCode::Char('x') if tasks_tab(app, snap) => Command::DropTask,
         KeyCode::Char('i') if routines_tab(app, snap) => Command::Inspect,
-        KeyCode::Char(ch @ '1'..='9') if threads_tab(app, snap) => {
+        KeyCode::Char(ch @ '1'..='9') if on_thread(app, snap) => {
             Command::NextLine((ch as u8 - b'1') as usize)
         }
         _ => Command::Nothing,
@@ -285,6 +285,10 @@ fn prompt_editing(app: &App) -> bool {
 
 fn threads_tab(app: &App, snap: &Snapshot) -> bool {
     tab_is(app, snap, 0) && app.focus == Focus::Overview
+}
+
+fn on_thread(app: &App, snap: &Snapshot) -> bool {
+    threads_tab(app, snap) && compose::selected_thread(app, snap).is_some()
 }
 
 fn tasks_tab(app: &App, snap: &Snapshot) -> bool {

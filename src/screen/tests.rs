@@ -1596,6 +1596,36 @@ fn contract_o_opens_the_selected_attention_thread() {
     let built = crate::screen::jobs::build(&app, snap, &Command::OpenWorker, Some("hp")).unwrap();
     assert!(built.pane.is_empty(), "{}", built.pane);
     assert!(built.target_id.is_empty(), "{}", built.target_id);
+
+    let previous = compose::thread_by_selection(card, start - 1).unwrap();
+    assert!(!previous.id.is_empty());
+    assert_eq!(compose::detail_rows(&app, snap)[0].0, "no thread");
+    assert_eq!(
+        press(&mut app, snap, KeyCode::Char('t')),
+        Command::StartThreadForm
+    );
+    let keys = [
+        (KeyCode::Char('r'), Command::Restart),
+        (KeyCode::Char('s'), Command::Stop),
+        (KeyCode::Char('a'), Command::Ack),
+        (KeyCode::Char('x'), Command::Resolve),
+        (KeyCode::Char('1'), Command::NextLine(0)),
+    ];
+    for (code, command) in keys {
+        assert_eq!(press(&mut app, snap, code), Command::Nothing);
+        let built = crate::screen::jobs::build(&app, snap, &command, Some("hp"));
+        assert!(
+            built.is_none(),
+            "start row copied {} pane {} into {} pane {}",
+            previous.id,
+            previous.pane_id,
+            built
+                .as_ref()
+                .map(|row| row.target_id.as_str())
+                .unwrap_or(""),
+            built.as_ref().map(|row| row.pane.as_str()).unwrap_or("")
+        );
+    }
 }
 
 #[test]

@@ -908,6 +908,15 @@ pub fn thread_by_selection(
         .and_then(|index| card.threads.get(*index))
 }
 
+pub fn selected_thread<'a>(
+    app: &App,
+    snap: &'a Snapshot,
+) -> Option<&'a crate::screen::load::ThreadLine> {
+    let card = app.card(snap)?;
+    let nav = app.nav.get(&card.id)?;
+    thread_by_selection(card, nav.threads.selected)
+}
+
 pub fn display_index(card: &Card, id: &str) -> Option<usize> {
     thread_order(card).into_iter().position(|index| {
         card.threads
@@ -981,12 +990,7 @@ pub fn detail_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
     let blank = || (".".into(), Command::Nothing);
     match tab {
         0 => {
-            let thread = card.and_then(|card| {
-                let index = card_nav(app, snap)
-                    .map(|nav| clamp(nav.threads.selected, card.threads.len()))
-                    .unwrap_or(0);
-                thread_by_selection(card, index)
-            });
+            let thread = selected_thread(app, snap);
             let head = thread
                 .map(thread_text)
                 .unwrap_or_else(|| "no thread".into());
@@ -1349,7 +1353,7 @@ pub fn open_worker_thread<'a>(
         return card.threads.iter().find(|thread| thread.id == thread_id);
     }
     if nav.tab == 0 {
-        return thread_by_selection(card, nav.threads.selected);
+        return selected_thread(app, snap);
     }
     None
 }

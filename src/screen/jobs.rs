@@ -368,10 +368,15 @@ pub(crate) fn build(
         request.slug = card.slug.clone();
         let fallback = Nav::default();
         let nav = app.nav.get(&card.id).unwrap_or(&fallback);
-        if let Some(thread) = compose::thread_by_selection(
-            card,
-            compose::clamp(nav.threads.selected, card.threads.len()),
-        ) {
+        if matches!(
+            command,
+            Command::Ack
+                | Command::Stop
+                | Command::Restart
+                | Command::Resolve
+                | Command::NextLine(_)
+        ) && let Some(thread) = compose::selected_thread(app, snap)
+        {
             request.target_id = thread.id.clone();
             request.pane = thread.pane_id.clone();
             request.machine = thread.machine.clone();
@@ -479,6 +484,13 @@ pub(crate) fn build(
         if request.prefix.is_empty() {
             return None;
         }
+    }
+    if matches!(
+        command,
+        Command::Ack | Command::Stop | Command::Restart | Command::Resolve | Command::NextLine(_)
+    ) && request.target_id.is_empty()
+    {
+        return None;
     }
     request.intent = intent(command, &request);
     if request.intent.is_empty() {
