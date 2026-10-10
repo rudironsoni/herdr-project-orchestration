@@ -409,8 +409,9 @@ fn place_tabs(
         tab.saturating_add(1).min(labels.len().saturating_sub(1))
     };
     let limit = col.x.saturating_add(col.w);
-    let mut x = col.x;
-    if let Some((start, stop)) = tab_window(&widths, current, col.w) {
+    let mut x = col.x.saturating_add(1).min(limit);
+    let room = col.w.saturating_sub(1);
+    if let Some((start, stop)) = tab_window(&widths, current, room) {
         if start > 0 {
             x = paint_chip(out, x, y, limit, "[<]", tab_command(start - 1), false);
         }
