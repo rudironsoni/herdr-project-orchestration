@@ -72,7 +72,6 @@ pub fn side_len(snap: &Snapshot, side: Side, filter: Option<&str>) -> usize {
                 .filter(|card| project_visible(&card.name, &card.slug, filter))
                 .count()
                 + snap.failed.len()
-                + 4
         }
         Side::Needs => head + snap.needs.len().max(1),
         Side::Inbox => head + snap.inbox.len().max(1),

@@ -221,35 +221,6 @@ pub fn side_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
                 let message = format!("{} {}", failed.message, failed.path);
                 rows.push((message.clone(), Command::ShowImport { message }));
             }
-            let card = app.card(snap);
-            let repos = card
-                .map(|card| {
-                    card.resources
-                        .iter()
-                        .filter(|row| row.kind == "repository")
-                        .count()
-                })
-                .unwrap_or(0);
-            let machines = card
-                .map(|card| {
-                    card.resources
-                        .iter()
-                        .filter(|row| row.kind == "machine")
-                        .count()
-                })
-                .unwrap_or(0);
-            let profiles = card
-                .map(|card| {
-                    card.resources
-                        .iter()
-                        .filter(|row| row.label.starts_with("harness profile"))
-                        .count()
-                })
-                .unwrap_or(0);
-            rows.push((format!("repositories: {repos}"), Command::Nothing));
-            rows.push((format!("machines: {machines}"), Command::Nothing));
-            rows.push((format!("harness profiles: {profiles}"), Command::Nothing));
-            rows.push(("Project menu".into(), Command::OpenMenu));
         }
         Side::Needs => {
             if snap.needs.is_empty() {
@@ -345,14 +316,14 @@ fn project_row(snap: &Snapshot, card: &Card) -> String {
     } else {
         format!(" {}", card.availability)
     };
-    let name = if card.name.is_empty() {
-        card.slug.as_str()
+    let name = if card.name.is_empty() || card.name == card.slug {
+        String::new()
     } else {
-        card.name.as_str()
+        format!(" {}", card.name)
     };
     format!(
-        "{} {} {} {} open {} attention{}",
-        card.slug, name, word, open, attention, availability
+        "{} {} {} open {} attention{}{}",
+        card.slug, word, open, attention, availability, name
     )
 }
 
@@ -377,9 +348,10 @@ fn place_tabs(
     overview: bool,
     tab: usize,
 ) -> u16 {
-    if y >= end {
+    if y >= end || col.w == 0 {
         return y;
     }
+    let focus_tabs = app.focus == Focus::Tabs;
     let mut labels = vec![(
         if overview {
             "[OVERVIEW]".into()
@@ -387,7 +359,7 @@ fn place_tabs(
             "[Overview]".into()
         },
         Command::ShowOverview,
-        overview && app.focus == Focus::Tabs,
+        overview && focus_tabs,
     )];
     for (index, name) in TABS.iter().enumerate() {
         let current = !overview && index == tab;
@@ -396,28 +368,113 @@ fn place_tabs(
         } else {
             format!("[{name}]")
         };
-        labels.push((
-            label,
-            Command::SelectTab(index),
-            current && app.focus == Focus::Tabs,
-        ));
+        labels.push((label, Command::SelectTab(index), current && focus_tabs));
     }
+    let widths: Vec<u16> = labels
+        .iter()
+        .map(|(label, _, _)| label.chars().count() as u16)
+        .collect();
+    let current = if overview {
+        0
+    } else {
+        tab.saturating_add(1).min(labels.len().saturating_sub(1))
+    };
+    let limit = col.x.saturating_add(col.w);
     let mut x = col.x;
-    let mut y = y;
-    for (label, command, selected) in labels {
-        let width = label.chars().count() as u16;
-        if x > col.x && x.saturating_add(width) > col.x.saturating_add(col.w) {
-            y += 1;
-            if y >= end {
-                return y;
-            }
-            x = col.x;
+    if let Some((start, stop)) = tab_window(&widths, current, col.w) {
+        if start > 0 {
+            x = paint_chip(out, x, y, limit, "[<]", tab_command(start - 1), false);
         }
-        let width = width.min(col.x.saturating_add(col.w).saturating_sub(x));
-        push(out, x, y, width, &label, command, (selected, false));
-        x = x.saturating_add(width).saturating_add(1);
+        for (label, command, selected) in labels.iter().take(stop).skip(start) {
+            x = paint_chip(out, x, y, limit, label, command.clone(), *selected);
+        }
+        if stop < labels.len() {
+            paint_chip(out, x, y, limit, "[>]", tab_command(stop), false);
+        }
+    } else if let Some((label, command, selected)) = labels.get(current) {
+        paint_chip(out, x, y, limit, label, command.clone(), *selected);
     }
     y + 1
+}
+
+fn tab_command(index: usize) -> Command {
+    if index == 0 {
+        Command::ShowOverview
+    } else {
+        Command::SelectTab(index - 1)
+    }
+}
+
+fn tab_window(widths: &[u16], current: usize, room: u16) -> Option<(usize, usize)> {
+    let count = widths.len();
+    if count == 0 || room == 0 || current >= count {
+        return None;
+    }
+    if row_span(widths, 0..count, false, false) <= room {
+        return Some((0, count));
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for start in 0..=current {
+        for stop in (current + 1)..=count {
+            let lead = start > 0;
+            let trail = stop < count;
+            if row_span(widths, start..stop, lead, trail) > room {
+                continue;
+            }
+            let replace = match best {
+                None => true,
+                Some((old_start, old_stop)) => {
+                    let span = stop - start;
+                    let old_span = old_stop - old_start;
+                    span > old_span || (span == old_span && start < old_start)
+                }
+            };
+            if replace {
+                best = Some((start, stop));
+            }
+        }
+    }
+    best
+}
+
+fn row_span(widths: &[u16], range: std::ops::Range<usize>, lead: bool, trail: bool) -> u16 {
+    let mut total = 0u16;
+    let mut count = 0u16;
+    if lead {
+        total = total.saturating_add(3);
+        count += 1;
+    }
+    for width in &widths[range] {
+        if count > 0 {
+            total = total.saturating_add(1);
+        }
+        total = total.saturating_add(*width);
+        count += 1;
+    }
+    if trail {
+        if count > 0 {
+            total = total.saturating_add(1);
+        }
+        total = total.saturating_add(3);
+    }
+    total
+}
+
+fn paint_chip(
+    out: &mut Vec<Placed>,
+    x: u16,
+    y: u16,
+    limit: u16,
+    label: &str,
+    command: Command,
+    selected: bool,
+) -> u16 {
+    if x >= limit {
+        return x;
+    }
+    let width = (label.chars().count() as u16).min(limit.saturating_sub(x));
+    push(out, x, y, width, label, command, (selected, false));
+    x.saturating_add(width).saturating_add(1)
 }
 
 fn place_work(
@@ -452,46 +509,19 @@ fn place_work(
                 Command::Nothing,
                 false,
             ));
-            lines.push((card.coordinator.clone(), Command::Nothing, false));
-            if let Some(thread) = card.threads.first() {
-                lines.push((thread_text(thread), Command::Nothing, false));
-            }
-            if let Some(report) = card
-                .reports
-                .iter()
-                .find(|line| !line.contains("no report file"))
-            {
-                lines.push((report.clone(), Command::Nothing, false));
-            }
             if let Some(id) = app.project_id(snap) {
-                if let Some(prompt) = app.prompts.get(&id) {
-                    for (text, label) in &prompt.outgoing {
-                        lines.push((
-                            format!("you sent: {text} ({label})"),
-                            Command::Nothing,
-                            false,
-                        ));
-                    }
+                if let Some(prompt) = app.prompts.get(&id)
+                    && let Some((text, label)) = prompt.outgoing.last()
+                {
+                    let status = label.split(':').next().unwrap_or(label);
+                    lines.push((
+                        format!("you sent: {text} ({status})"),
+                        Command::Nothing,
+                        false,
+                    ));
                 }
                 if let Some(notice) = app.notices.get(&id) {
                     lines.push((notice.clone(), Command::Nothing, false));
-                }
-            }
-            let recovery: Vec<String> = card
-                .recovery
-                .iter()
-                .cloned()
-                .chain(
-                    card.operations
-                        .iter()
-                        .filter(|line| !line.starts_with("operation done"))
-                        .cloned(),
-                )
-                .collect();
-            if !recovery.is_empty() {
-                lines.push(("RECOVERY".into(), Command::Nothing, false));
-                for line in recovery {
-                    lines.push((line, Command::Nothing, false));
                 }
             }
         }
@@ -544,6 +574,28 @@ fn place_work(
     } else {
         paint_lines(out, col, rows, lines, focus_work || prompt_focused);
     }
+}
+
+fn coordinator_mark(line: &str) -> String {
+    let body = line.trim().trim_start_matches("coordinator:").trim();
+    body.split(" pane ")
+        .next()
+        .unwrap_or(body)
+        .trim()
+        .to_string()
+}
+
+fn health_lines(card: &Card) -> Vec<String> {
+    let mut lines: Vec<String> = card.recovery.iter().take(4).cloned().collect();
+    for line in card
+        .operations
+        .iter()
+        .filter(|line| !line.starts_with("operation done"))
+        .take(2)
+    {
+        lines.push(line.clone());
+    }
+    lines
 }
 
 fn coordinator_blurb(line: &str) -> String {
@@ -658,12 +710,7 @@ fn feature_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
         3 => item_rows(
             &card.prs,
             "none",
-            |pr| {
-                format!(
-                    "{} recorded reference {} not a live check",
-                    pr.title, pr.reference
-                )
-            },
+            |pr| pr_text(&pr.title, &pr.reference),
             Command::Inspect,
         ),
         4 => item_rows(
@@ -772,7 +819,7 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
     } else {
         for thread in active {
             rows.push((
-                thread_text(thread),
+                thread_line(thread, false),
                 Command::OpenAttention {
                     project,
                     thread_id: thread.id.clone(),
@@ -788,7 +835,8 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
         .filter(|line| !line.contains("no report file"))
         .take(2)
     {
-        rows.push((report.clone(), Command::Nothing));
+        let text = report.lines().next().unwrap_or(report);
+        rows.push((text.to_string(), Command::Nothing));
         reports += 1;
     }
     if reports == 0 {
@@ -796,22 +844,17 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
     }
     rows.push(("HEALTH".into(), Command::Nothing));
     rows.push((coordinator_blurb(&card.coordinator), Command::Nothing));
-    let mut recovery = 0;
-    for line in card
-        .recovery
-        .iter()
-        .chain(
-            card.operations
-                .iter()
-                .filter(|line| !line.starts_with("operation done")),
-        )
-        .take(3)
-    {
-        rows.push((line.clone(), Command::Nothing));
-        recovery += 1;
+    let mark = coordinator_mark(&card.coordinator);
+    if !mark.is_empty() && !coordinator_blurb(&card.coordinator).contains(&mark) {
+        rows.push((mark, Command::Nothing));
     }
-    if recovery == 0 {
+    let recovery = health_lines(card);
+    if recovery.is_empty() {
         rows.push(("no recovery".into(), Command::Nothing));
+    } else {
+        for line in recovery {
+            rows.push((line, Command::Nothing));
+        }
     }
     if card.threads.is_empty() {
         rows.push(("Start first Thread".into(), Command::StartThreadForm));
@@ -989,13 +1032,8 @@ pub fn detail_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
             });
             vec![
                 (
-                    pr.map(|pr| {
-                        format!(
-                            "{} recorded reference {} not a live check",
-                            pr.title, pr.reference
-                        )
-                    })
-                    .unwrap_or_else(|| "no recorded reference".into()),
+                    pr.map(|pr| pr_text(&pr.title, &pr.reference))
+                        .unwrap_or_else(|| "no recorded reference".into()),
                     Command::Nothing,
                 ),
                 ("Open PR reference".into(), Command::OpenPr),
@@ -1225,7 +1263,15 @@ fn thread_rows(form: &crate::screen::state::ThreadForm) -> Vec<(String, Command)
     rows
 }
 
+fn pr_text(title: &str, reference: &str) -> String {
+    format!("{title} recorded reference, not a live check, {reference}")
+}
+
 fn thread_text(thread: &crate::screen::load::ThreadLine) -> String {
+    thread_line(thread, true)
+}
+
+fn thread_line(thread: &crate::screen::load::ThreadLine, full: bool) -> String {
     let mut text = format!("{} {}", thread.id, thread.kind);
     if !thread.harness.is_empty() {
         text.push(' ');
@@ -1250,12 +1296,12 @@ fn thread_text(thread: &crate::screen::load::ThreadLine) -> String {
     if thread.unavailable {
         text.push_str(" unavailable");
     }
-    if !thread.pr.is_empty() {
+    if full && !thread.pr.is_empty() {
         text.push_str(" recorded reference ");
         text.push_str(&thread.pr);
         text.push_str(" not a live check");
     }
-    if !thread.worktree.is_empty() {
+    if full && !thread.worktree.is_empty() {
         text.push(' ');
         text.push_str(&thread.worktree);
     }
@@ -1353,7 +1399,29 @@ fn push(
 }
 
 fn fit(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+    if width == 0 || text.is_empty() {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let keep = width - 1;
+    let mut end = text.len();
+    for (count, (index, _)) in text.char_indices().enumerate() {
+        if count == keep {
+            end = index;
+            break;
+        }
+    }
+    let head = &text[..end];
+    let cut = match head.rfind(char::is_whitespace) {
+        Some(space) if space > 0 && head[space..].chars().count() <= 12 => &head[..space],
+        _ => head,
+    };
+    format!("{}…", cut.trim_end())
 }
 
 pub fn clamp(index: usize, len: usize) -> usize {

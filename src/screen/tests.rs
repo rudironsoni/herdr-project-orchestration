@@ -286,11 +286,46 @@ fn contract_frames_at_the_layout_breakpoints() {
         assert!(text.contains("does not parse"), "{width}x{height}\n{text}");
         assert!(!text.contains("Draft:"), "{width}x{height}");
         assert!(!text.contains("ASK COORDINATOR"), "{width}x{height}");
+        assert!(!text.contains("Project menu"), "{width}x{height}");
+        assert!(!text.contains("repositories:"), "{width}x{height}");
+        assert!(!text.contains("coordinator:"), "{width}x{height}");
+        let tabs = compose::plan(&app, snap, width, height);
+        let ys: Vec<u16> = tabs
+            .iter()
+            .filter(|line| matches!(line.command, Command::ShowOverview | Command::SelectTab(_)))
+            .map(|line| line.y)
+            .collect();
+        assert!(!ys.is_empty(), "{width}x{height}");
+        assert!(ys.iter().all(|y| *y == ys[0]), "{width}x{height} {ys:?}");
         for line in text.lines() {
             assert_eq!(line.chars().count(), width as usize, "{width}x{height}");
         }
         save_frame(&format!("{width}x{height}.txt"), &text);
     }
+    let more = line_matching(&app, snap, 50, 30, |line| line.text == "[>]");
+    let Command::SelectTab(index) = more.command else {
+        panic!("{}", more.text);
+    };
+    assert_eq!(
+        input::click_command(&app, snap, more.x, more.y, 50, 30),
+        Command::SelectTab(index)
+    );
+    assert_eq!(
+        input::key_command(&mut app, snap, input::key(KeyCode::Char('g')), 50, 30),
+        Command::Nothing
+    );
+    let digit = char::from(b'1' + index as u8);
+    assert_eq!(
+        input::key_command(&mut app, snap, input::key(KeyCode::Char(digit)), 50, 30),
+        Command::SelectTab(index)
+    );
+    let kept = app.project_id(snap).unwrap();
+    state::apply(&mut app, Command::SelectTab(index), snap, 50);
+    assert_eq!(app.project_id(snap).unwrap(), kept);
+    assert_eq!(app.nav[&kept].tab, index);
+    assert!(!app.nav[&kept].overview);
+    app.nav.get_mut(&kept).unwrap().overview = true;
+    app.focus = Focus::Work;
     let mut long = snap.clone();
     let horizon_card = long
         .projects
@@ -312,28 +347,75 @@ fn contract_frames_at_the_layout_breakpoints() {
     let mid = frame(&app, snap, 120, 30);
     assert!(mid.contains("New Project"));
     assert!(mid.contains("horizon"));
+    let overview = frame(&app, snap, 160, 40);
+    assert!(overview.contains("GOAL"));
+    assert!(overview.contains("Stale coordinator"));
+    assert!(overview.contains("Inspect stale coordinator"));
+    assert!(overview.contains("Send instruction"));
+    assert!(overview.contains("report t-0001:"));
+    assert!(overview.contains("stale: socket missing"));
+    assert!(overview.contains("unresolved recovery"));
+    assert!(overview.contains("worktree identifiers were not stored"));
+    assert!(overview.contains("nothing was attached"));
+    assert!(overview.contains("pending"));
+    assert!(overview.contains("thread_start"));
+    assert!(overview.contains("[>]"));
+    assert!(!overview.contains("coordinator:"));
+    assert!(!overview.contains("Project menu"));
+    assert!(!overview.contains("repositories:"));
+    let placed = compose::plan(&app, snap, 160, 40);
+    assert!(
+        placed
+            .iter()
+            .any(|line| line.x < 31 && line.text.contains("horizon"))
+    );
+    assert!(placed.iter().any(|line| {
+        line.x < 31 && (line.text.contains("does not parse") || line.text.contains("project.json"))
+    }));
+    assert!(placed.iter().filter(|line| line.x < 31).all(|line| {
+        !line.text.contains("GOAL")
+            && !line.text.contains("COORDINATOR")
+            && !line.text.contains("repositories:")
+            && line.text != "Project menu"
+    }));
+    assert!(
+        placed
+            .iter()
+            .filter(|line| (32..96).contains(&line.x))
+            .all(|line| {
+                !line.text.contains("unresolved")
+                    && !line.text.contains("report t-")
+                    && !line.text.starts_with("coordinator:")
+                    && !line.text.contains("repositories:")
+            })
+    );
+    assert!(
+        placed
+            .iter()
+            .any(|line| line.x >= 96 && line.text.contains("unresolved recovery"))
+    );
+    state::apply(&mut app, Command::SelectTab(0), snap, 160);
+    let threads = frame(&app, snap, 160, 40);
+    assert!(threads.contains("LongTitleProbe"), "{threads}");
     state::apply(&mut app, Command::SelectTab(3), snap, 160);
+    let prs = frame(&app, snap, 160, 40);
+    assert!(prs.contains("recorded reference"), "{prs}");
+    assert!(prs.contains("not a live check"), "{prs}");
+    assert!(prs.contains("SELECTED / Horizon"), "{prs}");
+    state::apply(&mut app, Command::SelectTab(5), snap, 160);
+    let resources = frame(&app, snap, 160, 40);
+    assert!(resources.contains("repository "), "{resources}");
+    assert!(resources.contains("harness profile"), "{resources}");
+    assert!(!resources.contains("repositories:"), "{resources}");
     let id = app.project_id(snap).unwrap();
     app.prompt_mut(&id).outgoing.push((
         "look here".into(),
         "confirmed: herdr saw the agent working or blocked".into(),
     ));
     let wide = frame(&app, snap, 160, 40);
-    assert!(wide.contains("HERDR PROJECTS"));
-    assert!(wide.contains("New Project"));
-    assert!(wide.contains("Threads"));
-    assert!(wide.contains("LongTitleProbe"));
-    assert!(wide.contains("GOAL"));
-    assert!(wide.contains("report t-0001:"));
-    assert!(wide.contains("recorded reference"));
-    assert!(wide.contains("does not parse"));
-    assert!(wide.contains("stale: socket missing"));
-    assert!(wide.contains("unresolved recovery"));
-    assert!(wide.contains("worktree identifiers were not stored"));
-    assert!(wide.contains("nothing was attached"));
     assert!(wide.contains("you sent: look here"));
-    assert!(wide.contains("repositories: 4"));
-    assert!(wide.contains("harness profiles: 4"));
+    assert!(wide.contains("Inspect stale coordinator"));
+    assert!(wide.contains("Send instruction"));
     assert!(!wide.contains("replied"));
     assert!(!wide.contains("Accepted"));
     assert!(!wide.contains("w9:p9"));
@@ -429,9 +511,15 @@ fn contract_cockpit_selects_a_project_without_leaving_the_portfolio() {
     let len = state::side_len(snap, app.side, None);
     app.side_list.selected = len - 1;
     let scrolled = frame(&app, snap, 50, 30);
-    assert!(scrolled.contains("Project menu"), "{scrolled}");
+    assert!(scrolled.contains("does not parse"), "{scrolled}");
     assert!(scrolled.contains("SELECTED"), "{scrolled}");
-    assert!(!scrolled.contains("New Project"), "{scrolled}");
+    assert!(scrolled.contains("New Project"), "{scrolled}");
+    assert!(!scrolled.contains("Project menu"), "{scrolled}");
+    let short = frame(&app, snap, 50, 16);
+    assert!(short.contains("does not parse"), "{short}");
+    assert!(short.contains("SELECTED"), "{short}");
+    assert!(!short.contains("New Project"), "{short}");
+    assert!(!short.contains("Project menu"), "{short}");
 
     let mut counted = snap.clone();
     counted.inbox.push(load::InboxRow {
