@@ -117,7 +117,9 @@ pub fn plan(app: &App, snap: &Snapshot, width: u16, height: u16) -> Vec<Placed> 
         }
         Columns::Stacked => {
             let col = Col { x: x0, w: inner_w };
-            let (list, work, feature) = stacked_bands(body.start, body.end);
+            let list_need = 1 + side_rows(app, snap).len() as u16;
+            let work_need = 1 + work_lines(app, snap).0.len() as u16;
+            let (list, work, feature) = stacked_bands(body.start, body.end, list_need, work_need);
             let below = head_row(&mut out, &col, list, "PROJECTS");
             place_side(&mut out, app, snap, &col, below);
             let below = head_row(&mut out, &col, work, &column_name(app, snap));
@@ -151,17 +153,29 @@ pub fn plan(app: &App, snap: &Snapshot, width: u16, height: u16) -> Vec<Placed> 
 fn stacked_bands(
     start: u16,
     end: u16,
+    list_need: u16,
+    work_need: u16,
 ) -> (
     std::ops::Range<u16>,
     std::ops::Range<u16>,
     std::ops::Range<u16>,
 ) {
     let total = end.saturating_sub(start);
-    let list = ((total as u32 * 40 / 100) as u16)
+    let list_room = ((total as u32 * 40 / 100) as u16)
         .clamp(4, 8)
         .min(total.saturating_sub(8));
+    let list = if list_room == 0 {
+        0
+    } else {
+        list_need.min(list_room)
+    };
     let rest = total.saturating_sub(list);
-    let work = (rest / 2).clamp(4, 7).min(rest.saturating_sub(3));
+    let work_room = (rest / 2).clamp(4, 7).min(rest.saturating_sub(3));
+    let work = if work_room == 0 {
+        0
+    } else {
+        work_need.min(work_room)
+    };
     let list_end = start.saturating_add(list);
     let work_end = list_end.saturating_add(work).min(end);
     (start..list_end, list_end..work_end, work_end..end)
@@ -316,15 +330,17 @@ fn project_row(snap: &Snapshot, card: &Card) -> String {
     } else {
         format!(" {}", card.availability)
     };
-    let name = if card.name.is_empty() || card.name == card.slug {
+    let title = if card.name.is_empty() {
+        card.slug.clone()
+    } else {
+        card.name.clone()
+    };
+    let slug = if title == card.slug {
         String::new()
     } else {
-        format!(" {}", card.name)
+        format!(" {}", card.slug)
     };
-    format!(
-        "{} {} {} open {} attention{}{}",
-        card.slug, word, open, attention, availability, name
-    )
+    format!("{title} {word} {open} open {attention} attention{availability}{slug}")
 }
 
 fn column_name(app: &App, snap: &Snapshot) -> String {
@@ -477,16 +493,7 @@ fn paint_chip(
     x.saturating_add(width).saturating_add(1)
 }
 
-fn place_work(
-    out: &mut Vec<Placed>,
-    app: &App,
-    snap: &Snapshot,
-    col: &Col,
-    rows: std::ops::Range<u16>,
-) {
-    if rows.start >= rows.end {
-        return;
-    }
+fn work_lines(app: &App, snap: &Snapshot) -> (Vec<(String, Command, bool)>, usize) {
     let card = app.card(snap);
     let mut lines: Vec<(String, Command, bool)> = Vec::new();
     lines.push(("GOAL".into(), Command::Nothing, false));
@@ -550,6 +557,21 @@ fn place_work(
         lines.push((format!("{word}: {draft}"), Command::SubmitPrompt, true));
         tail_count += 1;
     }
+    (lines, tail_count)
+}
+
+fn place_work(
+    out: &mut Vec<Placed>,
+    app: &App,
+    snap: &Snapshot,
+    col: &Col,
+    rows: std::ops::Range<u16>,
+) {
+    if rows.start >= rows.end {
+        return;
+    }
+    let (mut lines, tail_count) = work_lines(app, snap);
+    let prompt_focused = app.focus == Focus::Prompt && app.stack.is_empty();
     let focus_work = app.focus == Focus::Work && app.stack.is_empty();
     let window = rows.end.saturating_sub(rows.start) as usize;
     if window > 0 && lines.len() > window {
@@ -813,16 +835,14 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
     for line in early {
         rows.push((line, Command::Nothing));
     }
-    rows.push(("NEEDS ATTENTION".into(), Command::Nothing));
     let needs: Vec<_> = snap
         .needs
         .iter()
         .filter(|row| row.project_id == card.id)
         .take(3)
         .collect();
-    if needs.is_empty() {
-        rows.push(("none".into(), Command::Nothing));
-    } else {
+    if !needs.is_empty() {
+        rows.push(("NEEDS ATTENTION".into(), Command::Nothing));
         for row in needs {
             rows.push((
                 format!("{} {}", row.thread_id, row.title),
@@ -833,16 +853,14 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
             ));
         }
     }
-    rows.push(("ACTIVE".into(), Command::Nothing));
     let active: Vec<_> = card
         .threads
         .iter()
         .filter(|thread| thread.status == "open" && !thread.pane_id.is_empty())
         .take(3)
         .collect();
-    if active.is_empty() {
-        rows.push(("none recorded".into(), Command::Nothing));
-    } else {
+    if !active.is_empty() {
+        rows.push(("ACTIVE".into(), Command::Nothing));
         for thread in active {
             rows.push((
                 thread_line(thread, false),
@@ -853,31 +871,29 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
             ));
         }
     }
-    rows.push(("RECENT".into(), Command::Nothing));
-    let mut reports = 0;
-    for report in card
+    let reports: Vec<_> = card
         .reports
         .iter()
         .filter(|line| !line.contains("no report file"))
         .take(2)
-    {
-        let text = report.lines().next().unwrap_or(report);
-        rows.push((text.to_string(), Command::Nothing));
-        reports += 1;
+        .collect();
+    if !reports.is_empty() {
+        rows.push(("RECENT".into(), Command::Nothing));
+        for report in reports {
+            let text = report.lines().next().unwrap_or(report);
+            rows.push((text.to_string(), Command::Nothing));
+        }
     }
-    if reports == 0 {
-        rows.push(("no report".into(), Command::Nothing));
-    }
-    rows.push(("HEALTH".into(), Command::Nothing));
-    rows.push((coordinator_blurb(&card.coordinator), Command::Nothing));
+    let blurb = coordinator_blurb(&card.coordinator);
     let mark = coordinator_mark(&card.coordinator);
-    if !mark.is_empty() && !coordinator_blurb(&card.coordinator).contains(&mark) {
-        rows.push((mark, Command::Nothing));
+    let mut health = Vec::new();
+    if !mark.is_empty() && !blurb.contains(&mark) {
+        health.push(mark);
     }
-    if recovery.is_empty() {
-        rows.push(("no recovery".into(), Command::Nothing));
-    } else {
-        for line in recovery {
+    health.extend(recovery);
+    if !health.is_empty() {
+        rows.push(("HEALTH".into(), Command::Nothing));
+        for line in health {
             rows.push((line, Command::Nothing));
         }
     }

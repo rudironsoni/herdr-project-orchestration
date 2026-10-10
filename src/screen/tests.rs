@@ -271,7 +271,7 @@ fn contract_frames_at_the_layout_breakpoints() {
         let text = frame(&app, snap, width, height);
         assert!(text.contains("HERDR PROJECTS"), "{width}x{height}\n{text}");
         assert!(text.contains("horizon"), "{width}x{height}");
-        assert!(text.contains("other"), "{width}x{height}");
+        assert!(text.contains("Other"), "{width}x{height}");
         assert!(text.contains("SELECTED"), "{width}x{height}");
         assert!(text.contains("New Project"), "{width}x{height}");
         assert!(
@@ -374,7 +374,7 @@ fn contract_frames_at_the_layout_breakpoints() {
     assert!(
         placed
             .iter()
-            .any(|line| line.x < 31 && line.text.contains("horizon"))
+            .any(|line| line.x < 31 && line.text.contains("Horizon"))
     );
     assert!(placed.iter().any(|line| {
         line.x < 31 && (line.text.contains("does not parse") || line.text.contains("project.json"))
@@ -459,6 +459,9 @@ fn contract_cockpit_selects_a_project_without_leaving_the_portfolio() {
     assert!(selected.contains("No coordinator recorded"), "{selected}");
     assert!(selected.contains("Start first Thread"), "{selected}");
     assert!(selected.contains("horizon"), "{selected}");
+    assert!(!selected.contains("no report"), "{selected}");
+    assert!(!selected.contains("no recovery"), "{selected}");
+    assert!(!selected.contains("NEEDS ATTENTION"), "{selected}");
     assert_eq!(app.project_id(snap).unwrap(), snap.projects[other].id);
     state::apply(&mut app, Command::SelectTab(1), snap, 60);
     assert_eq!(app.project_id(snap).unwrap(), snap.projects[other].id);
@@ -527,6 +530,44 @@ fn contract_cockpit_selects_a_project_without_leaving_the_portfolio() {
     assert!(short.contains("SELECTED"), "{short}");
     assert!(!short.contains("New Project"), "{short}");
     assert!(!short.contains("Project menu"), "{short}");
+
+    let mut phone_snap = snap.clone();
+    phone_snap.failed.clear();
+    phone_snap.needs.clear();
+    phone_snap.inbox.clear();
+    phone_snap.projects.retain(|card| card.slug == "other");
+    let mut phone_app = App::default();
+    phone_app.select_slug(&phone_snap, "other");
+    let phone = compose::plan(&phone_app, &phone_snap, 72, 40);
+    let selected_y = phone
+        .iter()
+        .find(|line| line.text.starts_with("SELECTED"))
+        .unwrap()
+        .y;
+    let last_above = phone
+        .iter()
+        .filter(|line| line.y < selected_y)
+        .map(|line| line.y)
+        .max()
+        .unwrap();
+    assert_eq!(last_above + 1, selected_y);
+    assert!(phone.iter().any(|line| line.text.starts_with("> Other ")));
+    assert!(phone.iter().any(|line| line.text == "[Resources]"));
+    assert!(!phone.iter().any(|line| line.text == "[>]"));
+    let phone_text = frame(&phone_app, &phone_snap, 72, 40);
+    save_frame("72x40.txt", &phone_text);
+    assert!(phone_text.contains("Start first Thread"), "{phone_text}");
+    assert!(phone_text.contains("New Project"), "{phone_text}");
+    assert!(!phone_text.contains("no report"), "{phone_text}");
+    assert!(!phone_text.contains("no recovery"), "{phone_text}");
+    assert!(!phone_text.contains("NEEDS ATTENTION"), "{phone_text}");
+    let work_y = phone.iter().find(|line| line.text == "WORK").unwrap().y;
+    let start_y = phone
+        .iter()
+        .find(|line| line.text == "Start first Thread")
+        .unwrap()
+        .y;
+    assert!(start_y < work_y + 8, "{phone_text}");
 
     let mut counted = snap.clone();
     counted.inbox.push(load::InboxRow {
@@ -1189,13 +1230,13 @@ fn contract_filter_sweep_rename_unarchive_and_copy() {
         on_width(&mut app, snap, KeyCode::Char(ch), 120);
     }
     let rows = compose::side_rows(&app, snap);
-    assert!(rows.iter().any(|(text, _)| text.starts_with("other ")));
-    assert!(!rows.iter().any(|(text, _)| text.starts_with("horizon ")));
+    assert!(rows.iter().any(|(text, _)| text.starts_with("Other ")));
+    assert!(!rows.iter().any(|(text, _)| text.starts_with("Horizon ")));
     for _ in 0..5 {
         on_width(&mut app, snap, KeyCode::Down, 120);
     }
     let picked = input::key_command(&mut app, snap, input::key(KeyCode::Enter), 120, 30);
-    let other = line_matching(&app, snap, 120, 30, |line| line.text.starts_with("other "));
+    let other = line_matching(&app, snap, 120, 30, |line| line.text.starts_with("Other "));
     assert_eq!(picked, Command::SelectProject(1));
     assert_eq!(
         input::click_command(&app, snap, other.x, other.y, 120, 30),
@@ -1210,7 +1251,7 @@ fn contract_filter_sweep_rename_unarchive_and_copy() {
     assert!(
         compose::side_rows(&app, snap)
             .iter()
-            .any(|(text, _)| text.starts_with("horizon "))
+            .any(|(text, _)| text.starts_with("Horizon "))
     );
 
     app.stack.clear();
