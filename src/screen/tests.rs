@@ -99,6 +99,9 @@ agent = \"pi\"
         };
         thread::allocate(&horizon, |thread| {
             thread.title = title;
+            if index == 5 {
+                thread.profile = "codex".into();
+            }
             thread.kind = if index == 5 {
                 Kind::Tab
             } else if index == 6 {
@@ -280,6 +283,7 @@ fn contract_frames_at_the_layout_breakpoints() {
             "{width}x{height}"
         );
         assert!(!text.contains("Terminal is too small"), "{width}x{height}");
+        assert!(text.contains("does not parse"), "{width}x{height}\n{text}");
         assert!(!text.contains("Draft:"), "{width}x{height}");
         assert!(!text.contains("ASK COORDINATOR"), "{width}x{height}");
         for line in text.lines() {
@@ -322,7 +326,7 @@ fn contract_frames_at_the_layout_breakpoints() {
     assert!(wide.contains("GOAL"));
     assert!(wide.contains("report t-0001:"));
     assert!(wide.contains("recorded reference"));
-    assert!(wide.contains("import failed"));
+    assert!(wide.contains("does not parse"));
     assert!(wide.contains("stale: socket missing"));
     assert!(wide.contains("unresolved recovery"));
     assert!(wide.contains("worktree identifiers were not stored"));
@@ -1310,4 +1314,249 @@ fn contract_filter_sweep_rename_unarchive_and_copy() {
     assert_eq!(outcome.status, "done", "{}", outcome.message);
     assert!(fixture._root.path().join("other-two").is_dir());
     assert!(!fixture._root.path().join("other").exists());
+}
+
+fn reload(fixture: &Fixture) -> Snapshot {
+    load::load(fixture._root.path(), fixture._config.path()).unwrap()
+}
+
+fn offers_open(card: &load::Card) -> bool {
+    state::coordinator_actions(Some(card))
+        .iter()
+        .any(|(_, command)| *command == Command::OpenConversation)
+}
+
+#[test]
+fn contract_open_coordinator_requires_the_live_primary() {
+    let fixture = fixture();
+    let project = crate::project::Project::load(fixture._root.path(), "horizon").unwrap();
+    let socket = fixture._root.path().join("live.sock");
+    std::fs::write(&socket, b"").unwrap();
+    project
+        .update_coordinator(|record| {
+            record.socket = socket.display().to_string();
+            record.pane_id = "w1:p1".into();
+            record.agent_name = "hpc-horizon".into();
+            record.profile = "claude".into();
+        })
+        .unwrap();
+
+    let snap = reload(&fixture);
+    let card = horizon(&snap);
+    assert!(
+        card.coordinator.contains("unavailable"),
+        "{}",
+        card.coordinator
+    );
+    assert!(!offers_open(card), "{}", card.coordinator);
+    let text = frame(&app_on(&snap), &snap, 120, 30);
+    assert!(text.contains("Inspect coordinator"), "{text}");
+    assert!(!text.contains("Open coordinator in Herdr"), "{text}");
+
+    let set = |status: &str| {
+        crate::coordinator::save_live(
+            &project,
+            &[crate::coordinator::LivePane {
+                pane_id: "w1:p1".into(),
+                agent_status: status.into(),
+                ..crate::coordinator::LivePane::default()
+            }],
+        )
+        .unwrap();
+    };
+    let expect = |status: &str, state: state::CoordinatorState, label: &str| {
+        set(status);
+        let snap = reload(&fixture);
+        let card = horizon(&snap);
+        assert_eq!(
+            state::coordinator_state(&card.coordinator),
+            state,
+            "{}",
+            card.coordinator
+        );
+        assert!(!offers_open(card), "{}", card.coordinator);
+        let text = frame(&app_on(&snap), &snap, 120, 30);
+        assert!(text.contains(label), "{text}");
+        assert!(!text.contains("Open coordinator in Herdr"), "{text}");
+    };
+    expect(
+        "working",
+        state::CoordinatorState::Working,
+        "Inspect working coordinator",
+    );
+    expect(
+        "blocked",
+        state::CoordinatorState::Blocked,
+        "Inspect blocked coordinator",
+    );
+    expect(
+        "starting",
+        state::CoordinatorState::Starting,
+        "Inspect starting coordinator",
+    );
+    expect(
+        "not-a-ready-state",
+        state::CoordinatorState::Unknown,
+        "Inspect coordinator",
+    );
+
+    set("idle");
+    let snap = reload(&fixture);
+    let card = horizon(&snap);
+    assert_eq!(
+        state::coordinator_state(&card.coordinator),
+        state::CoordinatorState::Recorded,
+        "{}",
+        card.coordinator
+    );
+    assert!(
+        card.coordinator.contains("status idle"),
+        "{}",
+        card.coordinator
+    );
+    assert!(offers_open(card));
+    let text = frame(&app_on(&snap), &snap, 120, 30);
+    assert!(text.contains("Open coordinator in Herdr"), "{text}");
+
+    let (store, row) = project.open_row().unwrap();
+    let session = store.primary_session(&row.id).unwrap().unwrap();
+    store.mark_session_stale(&session.id).unwrap();
+    let snap = reload(&fixture);
+    let card = horizon(&snap);
+    assert!(
+        card.coordinator.contains("stale: session"),
+        "{}",
+        card.coordinator
+    );
+    assert!(!offers_open(card), "{}", card.coordinator);
+    let text = frame(&app_on(&snap), &snap, 120, 30);
+    assert!(text.contains("Inspect stale coordinator"), "{text}");
+    assert!(!text.contains("Open coordinator in Herdr"), "{text}");
+}
+
+#[test]
+fn contract_o_opens_the_selected_attention_thread() {
+    let fixture = fixture();
+    let snap = &fixture.snap;
+    let mut app = app_on(snap);
+    app.focus = Focus::Overview;
+    let card = horizon(snap);
+    let id = app.project_id(snap).unwrap();
+    app.nav_mut(&id);
+    let failed = card
+        .threads
+        .iter()
+        .find(|thread| thread.pane_id == "w2:p3")
+        .unwrap();
+    assert_ne!(
+        press(&mut app, snap, KeyCode::Char('o')),
+        Command::OpenWorker
+    );
+
+    let need = &snap.needs[0];
+    assert_ne!(need.thread_id, failed.id);
+    let mut found = false;
+    for _ in 0..40 {
+        if compose::open_worker_thread(&app, snap).is_some_and(|thread| thread.id == need.thread_id)
+        {
+            found = true;
+            break;
+        }
+        state::apply(&mut app, Command::Move(1), snap, 160);
+    }
+    assert!(found, "attention row {} was not selected", need.thread_id);
+    assert_eq!(
+        press(&mut app, snap, KeyCode::Char('o')),
+        Command::OpenWorker
+    );
+    let built = crate::screen::jobs::build(&app, snap, &Command::OpenWorker, Some("hp")).unwrap();
+    assert_eq!(built.target_id, need.thread_id);
+    assert_ne!(built.pane, failed.pane_id);
+    assert_ne!(built.target_id, failed.id);
+
+    state::apply(&mut app, Command::SelectTab(0), snap, 160);
+    let tab = card
+        .threads
+        .iter()
+        .find(|thread| thread.kind == "tab")
+        .unwrap();
+    let index = compose::display_index(card, &tab.id).unwrap();
+    let id = app.project_id(snap).unwrap();
+    app.nav_mut(&id).threads.set(index, card.threads.len(), 8);
+    assert_eq!(
+        press(&mut app, snap, KeyCode::Char('o')),
+        Command::OpenWorker
+    );
+    let built = crate::screen::jobs::build(&app, snap, &Command::OpenWorker, Some("hp")).unwrap();
+    assert_eq!(built.target_id, tab.id);
+    assert_ne!(built.target_id, failed.id);
+}
+
+#[test]
+fn contract_thread_rows_show_harness_workspace_and_location() {
+    let fixture = fixture();
+    let snap = &fixture.snap;
+    let card = horizon(snap);
+    assert!(
+        card.threads
+            .iter()
+            .any(|thread| thread.kind == "tab" && thread.harness == "codex")
+    );
+    assert!(card.threads.iter().any(|thread| thread.kind == "checkout"));
+    assert!(card.threads.iter().any(|thread| thread.machine == "box-a"));
+    assert!(
+        card.threads
+            .iter()
+            .any(|thread| thread.worktree.ends_with("wt-one"))
+    );
+    assert!(
+        card.threads
+            .iter()
+            .any(|thread| thread.worktree.ends_with("wt-two"))
+    );
+    let mut app = app_on(snap);
+    state::apply(&mut app, Command::SelectTab(0), snap, 160);
+    let text = frame(&app, snap, 160, 40);
+    assert!(text.contains(" codex "), "{text}");
+    assert!(text.contains(" tab "), "{text}");
+    assert!(text.contains(" checkout "), "{text}");
+    assert!(text.contains(" box-a "), "{text}");
+    assert!(text.contains("wt-one"), "{text}");
+    assert!(text.contains("wt-two"), "{text}");
+}
+
+#[test]
+fn contract_failed_import_shows_the_diagnostic() {
+    let fixture = fixture();
+    let snap = &fixture.snap;
+    let failed = snap
+        .failed
+        .iter()
+        .find(|failed| failed.message.contains("does not parse"))
+        .unwrap();
+    let mut app = app_on(snap);
+    app.focus = Focus::Projects;
+    let row = line_matching(&app, snap, 120, 30, |line| {
+        line.text.contains("does not parse")
+    });
+    assert!(
+        matches!(row.command, Command::ShowImport { .. }),
+        "{:?}",
+        row.command
+    );
+    assert_eq!(
+        input::click_command(&app, snap, row.x, row.y, 120, 30),
+        row.command
+    );
+    let index = compose::side_rows(&app, snap)
+        .iter()
+        .position(|(text, _)| text.contains("does not parse"))
+        .unwrap();
+    app.side_list.selected = index;
+    let keyed = input::key_command(&mut app, snap, input::key(KeyCode::Enter), 120, 30);
+    assert_eq!(keyed, row.command);
+    state::apply(&mut app, keyed, snap, 120);
+    let id = app.project_id(snap).unwrap();
+    assert!(app.notices[&id].contains("does not parse"));
+    assert!(app.notices[&id].contains(&failed.path));
 }

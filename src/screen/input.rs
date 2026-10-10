@@ -159,7 +159,7 @@ fn detail_key(app: &App, snap: &Snapshot, key: &KeyEvent) -> Command {
         }
         KeyCode::Up => Command::Move(-1),
         KeyCode::Down => Command::Move(1),
-        KeyCode::Char('o') => Command::OpenWorker,
+        KeyCode::Char('o') => open_target(app, snap),
         KeyCode::Char('y') => copy_command(app, snap),
         _ => Command::Nothing,
     }
@@ -185,7 +185,7 @@ fn filter_key(app: &App, snap: &Snapshot, key: &KeyEvent, width: u16, height: u1
 }
 
 fn open_target(app: &App, snap: &Snapshot) -> Command {
-    if app.focus != Focus::Work {
+    if app.focus == Focus::Overview && compose::open_worker_thread(app, snap).is_some() {
         return Command::OpenWorker;
     }
     let card = app.card(snap);
@@ -197,7 +197,7 @@ fn open_target(app: &App, snap: &Snapshot) -> Command {
     actions
         .get(selected)
         .map(|(_, command)| command.clone())
-        .unwrap_or(Command::OpenWorker)
+        .unwrap_or(Command::Nothing)
 }
 
 fn copy_command(app: &App, snap: &Snapshot) -> Command {

@@ -373,6 +373,7 @@ pub enum Command {
     CopyPath(String),
     InspectCoordinator,
     OpenAttention { project: usize, thread_id: String },
+    ShowImport { message: String },
 }
 
 #[derive(Clone, Debug)]
@@ -624,6 +625,12 @@ pub fn apply(app: &mut App, command: Command, snap: &Snapshot, width: u16) -> Co
                     .map(|card| card.coordinator.clone())
                     .unwrap_or_else(|| "coordinator missing".into());
                 app.notices.insert(id, format!("not focused; {line}"));
+            }
+            Command::Nothing
+        }
+        Command::ShowImport { message } => {
+            if let Some(id) = app.project_id(snap) {
+                app.notices.insert(id, message);
             }
             Command::Nothing
         }
@@ -1102,18 +1109,36 @@ pub enum CoordinatorState {
     Missing,
     Stale,
     Ineligible,
+    Working,
+    Blocked,
+    Starting,
+    Unknown,
     Recorded,
 }
 
 pub fn coordinator_state(line: &str) -> CoordinatorState {
-    if line.is_empty() || line.contains("none recorded") {
+    let body = line.trim().trim_start_matches("coordinator:").trim();
+    if body.is_empty() || body.starts_with("none recorded") {
         CoordinatorState::Missing
-    } else if line.contains("stale") {
+    } else if body.starts_with("stale") {
         CoordinatorState::Stale
-    } else if line.contains("no socket") || line.contains("pane none") {
+    } else if body.starts_with("working") {
+        CoordinatorState::Working
+    } else if body.starts_with("blocked") {
+        CoordinatorState::Blocked
+    } else if body.starts_with("starting") {
+        CoordinatorState::Starting
+    } else if body.starts_with("unknown") {
+        CoordinatorState::Unknown
+    } else if body.starts_with("unavailable")
+        || body.starts_with("no socket")
+        || body.starts_with("pane none")
+    {
         CoordinatorState::Ineligible
-    } else {
+    } else if body.starts_with("socket present") {
         CoordinatorState::Recorded
+    } else {
+        CoordinatorState::Unknown
     }
 }
 
@@ -1130,7 +1155,25 @@ pub fn coordinator_actions(card: Option<&Card>) -> Vec<(String, Command)> {
                 Command::InspectCoordinator,
             ));
         }
-        CoordinatorState::Ineligible => {
+        CoordinatorState::Working => {
+            actions.push((
+                "Inspect working coordinator".into(),
+                Command::InspectCoordinator,
+            ));
+        }
+        CoordinatorState::Blocked => {
+            actions.push((
+                "Inspect blocked coordinator".into(),
+                Command::InspectCoordinator,
+            ));
+        }
+        CoordinatorState::Starting => {
+            actions.push((
+                "Inspect starting coordinator".into(),
+                Command::InspectCoordinator,
+            ));
+        }
+        CoordinatorState::Unknown | CoordinatorState::Ineligible => {
             actions.push(("Inspect coordinator".into(), Command::InspectCoordinator));
         }
         CoordinatorState::Recorded => {

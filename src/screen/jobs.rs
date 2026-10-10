@@ -420,6 +420,18 @@ pub(crate) fn build(
             request.pane = coordinator_pane(&card.coordinator);
             request.machine.clear();
         }
+        if matches!(command, Command::OpenWorker) {
+            if let Some(thread) = compose::open_worker_thread(app, snap) {
+                request.target_id = thread.id.clone();
+                request.pane = thread.pane_id.clone();
+                request.machine = thread.machine.clone();
+                request.pr = thread.pr.clone();
+                request.title = thread.title.clone();
+            } else if nav.overview {
+                request.pane.clear();
+                request.machine.clear();
+            }
+        }
     }
     if let Some(Layer::New(form)) = app.stack.last() {
         fill_new(&mut request, form);
@@ -530,7 +542,9 @@ fn intent(command: &Command, request: &Request) -> String {
         Command::Resolve => "resolve".into(),
         Command::NextLine(_) => "next".into(),
         Command::OpenPr => "open_pr".into(),
-        Command::InspectCoordinator | Command::OpenAttention { .. } => String::new(),
+        Command::InspectCoordinator
+        | Command::OpenAttention { .. }
+        | Command::ShowImport { .. } => String::new(),
         Command::ReadLibrary => "read_library".into(),
         Command::OpenResource => "open_resource".into(),
         Command::SubmitField => "field".into(),
@@ -577,6 +591,7 @@ fn runs(command: &Command) -> bool {
             | Command::RenameStart
             | Command::InspectCoordinator
             | Command::OpenAttention { .. }
+            | Command::ShowImport { .. }
     )
 }
 

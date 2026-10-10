@@ -218,10 +218,8 @@ pub fn side_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
                 rows.push((project_row(snap, card), Command::SelectProject(index)));
             }
             for failed in &snap.failed {
-                rows.push((
-                    format!("import failed {} {}", failed.path, failed.message),
-                    Command::Nothing,
-                ));
+                let message = format!("{} {}", failed.message, failed.path);
+                rows.push((message.clone(), Command::ShowImport { message }));
             }
             let card = app.card(snap);
             let repos = card
@@ -335,7 +333,11 @@ fn project_row(snap: &Snapshot, card: &Card) -> String {
     let word = match coordinator_state(&card.coordinator) {
         CoordinatorState::Missing => "missing",
         CoordinatorState::Stale => "stale",
-        CoordinatorState::Ineligible => "ineligible",
+        CoordinatorState::Ineligible => "unavailable",
+        CoordinatorState::Working => "working",
+        CoordinatorState::Blocked => "blocked",
+        CoordinatorState::Starting => "starting",
+        CoordinatorState::Unknown => "unknown",
         CoordinatorState::Recorded => "socket recorded",
     };
     let availability = if card.availability == "available" {
@@ -548,8 +550,12 @@ fn coordinator_blurb(line: &str) -> String {
     match coordinator_state(line) {
         CoordinatorState::Missing => "No coordinator recorded.".into(),
         CoordinatorState::Stale => {
-            "Stale coordinator. A missing socket is not a live agent.".into()
+            "Stale coordinator. The recorded pane is not a live primary.".into()
         }
+        CoordinatorState::Working => "Coordinator is working. Focus stays closed.".into(),
+        CoordinatorState::Blocked => "Coordinator is blocked. Focus stays closed.".into(),
+        CoordinatorState::Starting => "Coordinator is starting. Focus stays closed.".into(),
+        CoordinatorState::Unknown => "Coordinator status is unknown. Focus stays closed.".into(),
         CoordinatorState::Ineligible => "Coordinator record is not eligible to focus.".into(),
         CoordinatorState::Recorded => {
             "Socket recorded. A socket is not proof the agent is running.".into()
@@ -914,7 +920,7 @@ pub fn detail_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
                 thread_by_selection(card, index)
             });
             let head = thread
-                .map(|thread| format!("{} {} {}", thread.id, thread.title, thread.status))
+                .map(thread_text)
                 .unwrap_or_else(|| "no thread".into());
             let mut rows = vec![
                 (head, Command::Nothing),
@@ -1220,20 +1226,61 @@ fn thread_rows(form: &crate::screen::state::ThreadForm) -> Vec<(String, Command)
 }
 
 fn thread_text(thread: &crate::screen::load::ThreadLine) -> String {
-    let unavailable = if thread.unavailable {
-        " unavailable"
-    } else {
-        ""
-    };
-    let reference = if thread.pr.is_empty() {
-        String::new()
-    } else {
-        format!(" recorded reference {} not a live check", thread.pr)
-    };
-    format!(
-        "{} {} {}{unavailable}{reference}",
-        thread.id, thread.title, thread.status
-    )
+    let mut text = format!("{} {}", thread.id, thread.kind);
+    if !thread.harness.is_empty() {
+        text.push(' ');
+        text.push_str(&thread.harness);
+    }
+    if !thread.machine.is_empty() {
+        text.push(' ');
+        text.push_str(&thread.machine);
+    }
+    if !thread.worktree.is_empty()
+        && let Some(name) = std::path::Path::new(&thread.worktree)
+            .file_name()
+            .and_then(|name| name.to_str())
+    {
+        text.push(' ');
+        text.push_str(name);
+    }
+    text.push(' ');
+    text.push_str(&thread.status);
+    text.push(' ');
+    text.push_str(&thread.title);
+    if thread.unavailable {
+        text.push_str(" unavailable");
+    }
+    if !thread.pr.is_empty() {
+        text.push_str(" recorded reference ");
+        text.push_str(&thread.pr);
+        text.push_str(" not a live check");
+    }
+    if !thread.worktree.is_empty() {
+        text.push(' ');
+        text.push_str(&thread.worktree);
+    }
+    text
+}
+
+pub fn open_worker_thread<'a>(
+    app: &App,
+    snap: &'a Snapshot,
+) -> Option<&'a crate::screen::load::ThreadLine> {
+    let card = app.card(snap)?;
+    let nav = app.nav.get(&card.id)?;
+    if nav.overview {
+        let rows = feature_rows(app, snap);
+        let index = clamp(nav.overview_pos.selected, rows.len());
+        let thread_id = match rows.get(index).map(|(_, command)| command) {
+            Some(Command::OpenAttention { thread_id, .. }) => thread_id.as_str(),
+            _ => return None,
+        };
+        return card.threads.iter().find(|thread| thread.id == thread_id);
+    }
+    if nav.tab == 0 {
+        return thread_by_selection(card, clamp(nav.threads.selected, card.threads.len()));
+    }
+    None
 }
 
 fn prompt_bits(app: &App, snap: &Snapshot) -> (&'static str, String) {

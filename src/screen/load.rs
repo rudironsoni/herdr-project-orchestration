@@ -70,6 +70,9 @@ pub struct ThreadLine {
     pub files: Vec<String>,
     pub machine: String,
     pub pr: String,
+    pub kind: String,
+    pub worktree: String,
+    pub harness: String,
     pub unavailable: bool,
 }
 
@@ -335,6 +338,11 @@ fn thread_line(project: &Project, thread: &Thread) -> ThreadLine {
         thread::Status::Failed => "failed",
         thread::Status::Resolved => "resolved",
     };
+    let harness = if thread.profile.is_empty() {
+        thread.agent.clone()
+    } else {
+        thread.profile.clone()
+    };
     ThreadLine {
         unavailable: thread.status == thread::Status::Failed || thread.pane_id.is_empty(),
         id: thread.id.clone(),
@@ -343,7 +351,19 @@ fn thread_line(project: &Project, thread: &Thread) -> ThreadLine {
         pane_id: thread.pane_id.clone(),
         machine: thread.machine.clone(),
         pr: thread.pr.clone(),
+        kind: kind_word(thread.kind).into(),
+        worktree: thread.worktree_path.clone(),
+        harness,
         files: thread_files(project, &thread.id),
+    }
+}
+
+fn kind_word(kind: thread::Kind) -> &'static str {
+    match kind {
+        thread::Kind::Worktree => "worktree",
+        thread::Kind::Tab => "tab",
+        thread::Kind::Checkout => "checkout",
+        thread::Kind::Adopted => "adopted",
     }
 }
 
@@ -386,33 +406,55 @@ fn needs_attention(project: &Project, id: &str) -> bool {
 }
 
 fn coordinator_line(project: &Project) -> String {
-    match project.coordinator() {
-        None => "coordinator: none recorded".into(),
-        Some(record) => {
-            let socket = if record.socket.is_empty() {
-                "no socket"
-            } else if Path::new(&record.socket).exists() {
-                "socket present"
-            } else {
-                "stale: socket missing"
-            };
-            let name = if record.agent_name.is_empty() {
-                "unnamed"
-            } else {
-                record.agent_name.as_str()
-            };
-            let pane = if record.pane_id.is_empty() {
-                "none"
-            } else {
-                record.pane_id.as_str()
-            };
-            let profile = if record.profile.is_empty() {
-                record.agent.as_str()
-            } else {
-                record.profile.as_str()
-            };
-            format!("coordinator: {socket} pane {pane} {name} profile {profile}")
+    let Ok((store, row)) = project.open_row() else {
+        return "coordinator: none recorded".into();
+    };
+    let Ok(Some(session)) = store.primary_session(&row.id) else {
+        return "coordinator: none recorded".into();
+    };
+    let name = if session.agent_name.is_empty() {
+        "unnamed"
+    } else {
+        session.agent_name.as_str()
+    };
+    let pane = if session.pane_id.is_empty() {
+        "none"
+    } else {
+        session.pane_id.as_str()
+    };
+    let profile = if session.profile.is_empty() {
+        session.agent_kind.as_str()
+    } else {
+        session.profile.as_str()
+    };
+    let tail = format!("pane {pane} {name} profile {profile}");
+    if session.stale || session.unbound_at.is_some() {
+        return format!("coordinator: stale: session {tail}");
+    }
+    if session.herdr_socket.is_empty() {
+        return format!("coordinator: no socket {tail}");
+    }
+    if !Path::new(&session.herdr_socket).exists() {
+        return format!("coordinator: stale: socket missing {tail}");
+    }
+    if session.pane_id.is_empty() {
+        return format!("coordinator: pane none {tail}");
+    }
+    let live = crate::coordinator::live(project);
+    let Some(found) = live.iter().find(|item| item.pane_id == session.pane_id) else {
+        return format!("coordinator: unavailable {tail}");
+    };
+    match found.agent_status.as_str() {
+        "idle" | "done" => {
+            format!(
+                "coordinator: socket present {tail} status {}",
+                found.agent_status
+            )
         }
+        "working" => format!("coordinator: working {tail}"),
+        "blocked" => format!("coordinator: blocked {tail}"),
+        "starting" => format!("coordinator: starting {tail}"),
+        _ => format!("coordinator: unknown {tail}"),
     }
 }
 
