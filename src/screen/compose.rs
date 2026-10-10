@@ -161,7 +161,7 @@ fn stacked_bands(
         .clamp(4, 8)
         .min(total.saturating_sub(8));
     let rest = total.saturating_sub(list);
-    let work = (rest / 2).clamp(4, 9).min(rest.saturating_sub(3));
+    let work = (rest / 2).clamp(4, 7).min(rest.saturating_sub(3));
     let list_end = start.saturating_add(list);
     let work_end = list_end.saturating_add(work).min(end);
     (start..list_end, list_end..work_end, work_end..end)
@@ -585,17 +585,39 @@ fn coordinator_mark(line: &str) -> String {
         .to_string()
 }
 
-fn health_lines(card: &Card) -> Vec<String> {
-    let mut lines: Vec<String> = card.recovery.iter().take(4).cloned().collect();
+fn health_lines(card: &Card) -> (Vec<String>, Vec<String>) {
+    let mut early = Vec::new();
+    if let Some(line) = card
+        .recovery
+        .iter()
+        .find(|line| line.starts_with("unresolved"))
+    {
+        early.push(line.clone());
+    }
+    if let Some(line) = card
+        .operations
+        .iter()
+        .find(|line| !line.starts_with("operation done"))
+    {
+        early.push(line.clone());
+    }
+    let mut rest = Vec::new();
+    for line in card.recovery.iter().take(4) {
+        if !early.contains(line) {
+            rest.push(line.clone());
+        }
+    }
     for line in card
         .operations
         .iter()
         .filter(|line| !line.starts_with("operation done"))
         .take(2)
     {
-        lines.push(line.clone());
+        if !early.contains(line) {
+            rest.push(line.clone());
+        }
     }
-    lines
+    (early, rest)
 }
 
 fn coordinator_blurb(line: &str) -> String {
@@ -787,6 +809,10 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
         format!("{open} open  {failed} failed  {resolved} resolved"),
         Command::Nothing,
     ));
+    let (early, recovery) = health_lines(card);
+    for line in early {
+        rows.push((line, Command::Nothing));
+    }
     rows.push(("NEEDS ATTENTION".into(), Command::Nothing));
     let needs: Vec<_> = snap
         .needs
@@ -848,7 +874,6 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
     if !mark.is_empty() && !coordinator_blurb(&card.coordinator).contains(&mark) {
         rows.push((mark, Command::Nothing));
     }
-    let recovery = health_lines(card);
     if recovery.is_empty() {
         rows.push(("no recovery".into(), Command::Nothing));
     } else {

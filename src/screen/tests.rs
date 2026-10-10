@@ -284,6 +284,13 @@ fn contract_frames_at_the_layout_breakpoints() {
         );
         assert!(!text.contains("Terminal is too small"), "{width}x{height}");
         assert!(text.contains("does not parse"), "{width}x{height}\n{text}");
+        if matches!((width, height), (50, 30) | (70, 30) | (80, 24)) {
+            assert!(
+                text.contains("unresolved recovery"),
+                "{width}x{height}\n{text}"
+            );
+            assert!(text.contains("thread_start"), "{width}x{height}\n{text}");
+        }
         assert!(!text.contains("Draft:"), "{width}x{height}");
         assert!(!text.contains("ASK COORDINATOR"), "{width}x{height}");
         assert!(!text.contains("Project menu"), "{width}x{height}");
