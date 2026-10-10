@@ -436,7 +436,7 @@ fn contract_cockpit_selects_a_project_without_leaving_the_portfolio() {
     preset.select_slug(snap, "other");
     let preset_text = frame(&preset, snap, 80, 24);
     assert!(preset_text.contains("SELECTED / Other"), "{preset_text}");
-    assert!(preset_text.contains("horizon"), "{preset_text}");
+    assert!(preset_text.contains("Horizon"), "{preset_text}");
     assert!(preset_text.contains("Start coordinator"), "{preset_text}");
     assert!(preset.pending_focus.is_none());
 
@@ -458,7 +458,7 @@ fn contract_cockpit_selects_a_project_without_leaving_the_portfolio() {
     assert!(selected.contains("Start coordinator"), "{selected}");
     assert!(selected.contains("No coordinator recorded"), "{selected}");
     assert!(selected.contains("Start first Thread"), "{selected}");
-    assert!(selected.contains("horizon"), "{selected}");
+    assert!(selected.contains("Horizon"), "{selected}");
     assert!(!selected.contains("no report"), "{selected}");
     assert!(!selected.contains("no recovery"), "{selected}");
     assert!(!selected.contains("NEEDS ATTENTION"), "{selected}");
@@ -568,6 +568,23 @@ fn contract_cockpit_selects_a_project_without_leaving_the_portfolio() {
         .unwrap()
         .y;
     assert!(start_y < work_y + 8, "{phone_text}");
+    assert!(
+        phone
+            .iter()
+            .any(|line| line.text.starts_with("> Other missing"))
+    );
+    assert!(
+        !phone
+            .iter()
+            .any(|line| line.text.starts_with("> Other ") && line.text.contains("0 open"))
+    );
+    phone_snap.projects[0].goal =
+        "Finish the SQLAlchemy 2.0 adoption in partners. The full goal stays readable on a phone."
+            .into();
+    let wrapped = frame(&phone_app, &phone_snap, 72, 40);
+    assert!(wrapped.contains("Finish the SQLAlchemy"), "{wrapped}");
+    assert!(wrapped.contains("phone."), "{wrapped}");
+    assert!(wrapped.contains("Start first Thread"), "{wrapped}");
 
     let mut counted = snap.clone();
     counted.inbox.push(load::InboxRow {

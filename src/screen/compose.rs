@@ -119,7 +119,16 @@ pub fn plan(app: &App, snap: &Snapshot, width: u16, height: u16) -> Vec<Placed> 
             let col = Col { x: x0, w: inner_w };
             let list_need = 1 + side_rows(app, snap).len() as u16;
             let work_need = 1 + work_lines(app, snap).0.len() as u16;
-            let (list, work, feature) = stacked_bands(body.start, body.end, list_need, work_need);
+            let feature_need = feature_block_lines(app, snap);
+            let goal_extra = goal_extra_lines(app, snap, inner_w);
+            let (list, work, feature) = stacked_bands(
+                body.start,
+                body.end,
+                list_need,
+                work_need,
+                feature_need,
+                goal_extra,
+            );
             let below = head_row(&mut out, &col, list, "PROJECTS");
             place_side(&mut out, app, snap, &col, below);
             let below = head_row(&mut out, &col, work, &column_name(app, snap));
@@ -155,6 +164,8 @@ fn stacked_bands(
     end: u16,
     list_need: u16,
     work_need: u16,
+    feature_need: u16,
+    goal_extra: u16,
 ) -> (
     std::ops::Range<u16>,
     std::ops::Range<u16>,
@@ -171,11 +182,13 @@ fn stacked_bands(
     };
     let rest = total.saturating_sub(list);
     let work_room = (rest / 2).clamp(4, 7).min(rest.saturating_sub(3));
-    let work = if work_room == 0 {
+    let work_base = if work_room == 0 {
         0
     } else {
         work_need.min(work_room)
     };
+    let spare = total.saturating_sub(list.saturating_add(work_base).saturating_add(feature_need));
+    let work = work_base.saturating_add(spare.min(goal_extra));
     let list_end = start.saturating_add(list);
     let work_end = list_end.saturating_add(work).min(end);
     (start..list_end, list_end..work_end, work_end..end)
@@ -335,12 +348,12 @@ fn project_row(snap: &Snapshot, card: &Card) -> String {
     } else {
         card.name.clone()
     };
-    let slug = if title == card.slug {
+    let counts = if open == 0 && attention == 0 {
         String::new()
     } else {
-        format!(" {}", card.slug)
+        format!(" {open} open {attention} attention")
     };
-    format!("{title} {word} {open} open {attention} attention{availability}{slug}")
+    format!("{title} {word}{counts}{availability}")
 }
 
 fn column_name(app: &App, snap: &Snapshot) -> String {
@@ -574,6 +587,10 @@ fn place_work(
     let prompt_focused = app.focus == Focus::Prompt && app.stack.is_empty();
     let focus_work = app.focus == Focus::Work && app.stack.is_empty();
     let window = rows.end.saturating_sub(rows.start) as usize;
+    let extra = window.saturating_sub(lines.len());
+    if extra > 0 {
+        expand_goal(&mut lines, col.w as usize, extra);
+    }
     if window > 0 && lines.len() > window {
         let tail_count = tail_count.min(window);
         let status_room = window - tail_count;
@@ -596,6 +613,98 @@ fn place_work(
     } else {
         paint_lines(out, col, rows, lines, focus_work || prompt_focused);
     }
+}
+
+fn feature_block_lines(app: &App, snap: &Snapshot) -> u16 {
+    let body = if matches!(app.stack.last(), Some(Layer::Detail)) {
+        detail_rows(app, snap).len()
+    } else {
+        1 + feature_rows(app, snap).len()
+    };
+    1 + body as u16
+}
+
+fn goal_extra_lines(app: &App, snap: &Snapshot, width: u16) -> u16 {
+    let Some(card) = app.card(snap) else {
+        return 0;
+    };
+    if card.goal.is_empty() || width <= 1 {
+        return 0;
+    }
+    let lines = wrap_text(&card.goal, width as usize, 8);
+    lines.len().saturating_sub(1) as u16
+}
+
+fn expand_goal(lines: &mut Vec<(String, Command, bool)>, width: usize, extra: usize) {
+    let Some(index) = lines.iter().position(|(text, _, _)| text == "GOAL") else {
+        return;
+    };
+    let goal_at = index + 1;
+    if goal_at >= lines.len() || extra == 0 || width == 0 {
+        return;
+    }
+    let wrapped = wrap_text(&lines[goal_at].0, width, extra + 1);
+    if wrapped.len() <= 1 {
+        return;
+    }
+    lines.remove(goal_at);
+    for (offset, line) in wrapped.into_iter().enumerate() {
+        lines.insert(goal_at + offset, (line, Command::Nothing, false));
+    }
+}
+
+fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 || width == 0 {
+        return Vec::new();
+    }
+    if max_lines == 1 {
+        return vec![fit(text, width)];
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return vec![fit(text, width)];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut index = 0;
+    while index < words.len() && lines.len() + 1 < max_lines {
+        let word = words[index];
+        let room = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+        if !current.is_empty() && room > width {
+            lines.push(std::mem::take(&mut current));
+            continue;
+        }
+        if current.is_empty() && word.chars().count() > width {
+            break;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+        index += 1;
+    }
+    let rest = if index >= words.len() {
+        current
+    } else if current.is_empty() {
+        words[index..].join(" ")
+    } else {
+        format!("{current} {}", words[index..].join(" "))
+    };
+    if lines.len() < max_lines && !rest.is_empty() {
+        if index < words.len() || rest.chars().count() > width {
+            lines.push(fit(&rest, width));
+        } else {
+            lines.push(rest);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(fit(text, width));
+    }
+    lines
 }
 
 fn coordinator_mark(line: &str) -> String {
@@ -887,7 +996,7 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
     let blurb = coordinator_blurb(&card.coordinator);
     let mark = coordinator_mark(&card.coordinator);
     let mut health = Vec::new();
-    if !mark.is_empty() && !blurb.contains(&mark) {
+    if !mark.is_empty() && !blurb.contains(&mark) && mark.contains(':') {
         health.push(mark);
     }
     health.extend(recovery);
