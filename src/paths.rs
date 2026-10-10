@@ -42,7 +42,10 @@ impl Env {
 
     /// A variable's value; an empty value counts as unset.
     pub fn var(&self, key: &str) -> Option<&str> {
-        self.vars.get(key).map(String::as_str).filter(|v| !v.is_empty())
+        self.vars
+            .get(key)
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
     }
 
     /// The fixed user-level config directory, `~/.config/herdr-projects`.
@@ -168,7 +171,9 @@ fn session_by_name(name: &str, env: &Env, runner: &dyn Runner) -> Result<Session
             socket: found.socket_path,
             name: Some(name.to_string()),
         }),
-        None => bail!("herdr has no session named `{name}`; start it with `herdr --session {name}`"),
+        None => {
+            bail!("herdr has no session named `{name}`; start it with `herdr --session {name}`")
+        }
     }
 }
 
@@ -218,7 +223,10 @@ mod tests {
     #[test]
     fn empty_variable_counts_as_unset() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("HERDR_PROJECTS_ROOT", ""), ("HERDR_BIN_PATH", "")]);
+        let env = Env::for_test(
+            home.path(),
+            &[("HERDR_PROJECTS_ROOT", ""), ("HERDR_BIN_PATH", "")],
+        );
         assert_eq!(
             resolve_root(None, &env, &home.path().join("none")).unwrap(),
             home.path().join(".herdr-projects")
@@ -247,7 +255,10 @@ mod tests {
             socket: None,
         };
         let got = resolve_session(&by_name, &env, &runner).unwrap();
-        assert_eq!(got.socket, PathBuf::from("/h/.config/herdr/sessions/hp-dev/herdr.sock"));
+        assert_eq!(
+            got.socket,
+            PathBuf::from("/h/.config/herdr/sessions/hp-dev/herdr.sock")
+        );
         assert_eq!(got.name.as_deref(), Some("hp-dev"));
 
         let by_socket = SessionFlags {
@@ -255,11 +266,23 @@ mod tests {
             socket: Some("/flag.sock".into()),
         };
         let got = resolve_session(&by_socket, &env, &runner).unwrap();
-        assert_eq!(got, Session { socket: "/flag.sock".into(), name: None });
+        assert_eq!(
+            got,
+            Session {
+                socket: "/flag.sock".into(),
+                name: None
+            }
+        );
 
         let none = SessionFlags::default();
         let got = resolve_session(&none, &env, &runner).unwrap();
-        assert_eq!(got, Session { socket: "/env.sock".into(), name: None });
+        assert_eq!(
+            got,
+            Session {
+                socket: "/env.sock".into(),
+                name: None
+            }
+        );
 
         let env = Env::for_test(Path::new("/h"), &[("HERDR_SESSION", "hp-dev")]);
         let got = resolve_session(&none, &env, &runner).unwrap();
@@ -267,7 +290,13 @@ mod tests {
 
         let env = Env::for_test(Path::new("/h"), &[]);
         let got = resolve_session(&none, &env, &runner).unwrap();
-        assert_eq!(got, Session { socket: "/h/.config/herdr/herdr.sock".into(), name: None });
+        assert_eq!(
+            got,
+            Session {
+                socket: "/h/.config/herdr/herdr.sock".into(),
+                name: None
+            }
+        );
     }
 
     #[test]

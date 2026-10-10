@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::ids::ENV_LOCAL;
+use crate::store::{SessionDraft, Store};
+
 pub const MAX_SLUG: usize = 40;
 pub const BODY_WARN_CHARS: usize = 16_000;
 
@@ -20,7 +23,9 @@ pub fn validate_slug(slug: &str) -> Result<()> {
         .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
     let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     if !first_ok || !rest_ok || slug.len() > MAX_SLUG {
-        bail!("`{slug}` is not a valid slug (lower-case letters, digits and hyphens, at most {MAX_SLUG} characters)");
+        bail!(
+            "`{slug}` is not a valid slug (lower-case letters, digits and hyphens, at most {MAX_SLUG} characters)"
+        );
     }
     Ok(())
 }
@@ -64,7 +69,10 @@ pub fn humanize(slug: &str) -> String {
         .filter(|word| !word.is_empty())
         .map(|word| {
             let mut chars = word.chars();
-            chars.next().map(|first| first.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default()
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+                .unwrap_or_default()
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -77,8 +85,14 @@ pub fn humanize(slug: &str) -> String {
 pub fn display_name(name: &str, slug: &str) -> String {
     let name = name.trim();
     let base = if name.is_empty() { slug } else { name };
-    let slug_like = base.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
-    if slug_like { humanize(base) } else { base.to_string() }
+    let slug_like = base
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if slug_like {
+        humanize(base)
+    } else {
+        base.to_string()
+    }
 }
 
 /// The label of a project's home Space: its display name plus
@@ -178,7 +192,8 @@ pub fn parse_project_md(text: &str) -> Result<(Settings, String)> {
             .map(|front| (front, ""))
             .context("PROJECT.md front matter has no closing `+++` line")?,
     };
-    let settings: Settings = toml::from_str(front).context("PROJECT.md front matter does not parse")?;
+    let settings: Settings =
+        toml::from_str(front).context("PROJECT.md front matter does not parse")?;
     Ok((settings, body.trim_start_matches('\n').to_string()))
 }
 
@@ -203,12 +218,12 @@ impl std::fmt::Display for Status {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-struct ProjectState {
-    status: Status,
+pub(crate) struct ProjectState {
+    pub(crate) status: Status,
     /// Slugs the project had before `rename`, oldest first: its threads'
     /// branches (`hp/<slug>/...`) keep the name they were made with.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    former_slugs: Vec<String>,
+    pub(crate) former_slugs: Vec<String>,
 }
 
 /// The session and workspace the project belongs to, and the coordinator pane
@@ -217,12 +232,15 @@ struct ProjectState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct Coordinator {
+    /// `env_local` or the remote environment id. Empty means local.
+    pub environment_id: String,
     pub socket: String,
     /// Empty when the session was chosen by socket path alone.
     pub session: String,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
+    pub terminal_id: String,
     pub agent_name: String,
     /// The canonical project folder.
     pub cwd: String,
@@ -319,10 +337,19 @@ impl Project {
             root: root.to_path_buf(),
             slug: slug.to_string(),
         };
-        if !project.project_md().is_file() {
-            bail!("no project `{slug}` in {}", root.display());
+        if project.project_md().is_file() {
+            return Ok(project);
         }
-        Ok(project)
+        if root.join(crate::store::REGISTRY_FILE).is_file()
+            && let Ok(store) = Store::open(root)
+            && let Ok(Some(row)) = store.project_by_slug(slug)
+        {
+            if row.availability != "missing" {
+                let _ = store.set_availability(&row.id, "missing");
+            }
+            return Ok(project);
+        }
+        bail!("no project `{slug}` in {}", root.display());
     }
 
     pub fn dir(&self) -> PathBuf {
@@ -367,60 +394,222 @@ impl Project {
         parse_project_md(&text)
     }
 
+    pub(crate) fn open_row(&self) -> Result<(Store, crate::store::ProjectRow)> {
+        let store = Store::open(&self.root)?;
+        let slug = self.slug.clone();
+        let directory = self.canonical_dir().to_string_lossy().into_owned();
+        let (state_path, coordinator_path) = crate::legacy_import::operational_paths(self);
+        let row = store.immediate(|store| {
+            store.reconcile_observed()?;
+            if let Some(row) = store.project_by_slug(&slug)? {
+                let pending = store.pending_kind(&row.id, "create_project")?.is_some()
+                    || store.pending_kind(&row.id, "rename_project")?.is_some()
+                    || store.pending_kind(&row.id, "delete_project")?.is_some();
+                if !pending
+                    && row.lifecycle != "deleted"
+                    && !Path::new(&row.directory).join("PROJECT.md").is_file()
+                    && row.availability != "missing"
+                {
+                    store.set_availability(&row.id, "missing")?;
+                }
+                return store.project_by_id(&row.id);
+            }
+            if store.import_status(&directory)?.as_deref() == Some("failed") {
+                bail!("project `{slug}` did not import; `doctor` names the file");
+            }
+            let (lifecycle, former_slugs, coordinator) =
+                crate::legacy_import::read_project_state(&state_path, &coordinator_path)?;
+            let row = store.insert_project(&slug, &directory, &lifecycle)?;
+            for former in &former_slugs {
+                store.add_former_slug(&row.id, former)?;
+            }
+            if let Some(record) = coordinator.filter(|record| !record.pane_id.is_empty()) {
+                store.save_primary(&row.id, &draft_from_coordinator(&record))?;
+            }
+            let thread_errors = crate::legacy_import::read_thread_files(store, self, &row.id)?;
+            store.note_import(&directory, "imported", &thread_errors, Some(&row.id))?;
+            Ok(row)
+        });
+        let row = match row {
+            Ok(row) => row,
+            Err(error) if error.to_string().contains("does not parse") => {
+                store.note_import(&directory, "failed", &error.to_string(), None)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        Ok((store, row))
+    }
+
+    pub fn reconcile_repositories(&self) -> Result<bool> {
+        let (settings, _) = self.read_project_md()?;
+        let pairs: Vec<(String, String)> = settings
+            .repos
+            .iter()
+            .map(|repo| (repo.path.clone(), repo.machine.clone().unwrap_or_default()))
+            .collect();
+        let view: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(path, machine)| (path.as_str(), machine.as_str()))
+            .collect();
+        let (store, row) = self.open_row()?;
+        store.reconcile_repos(&row.id, &view)
+    }
+
+    pub fn import_failed(&self) -> bool {
+        let Ok(store) = Store::open(&self.root) else {
+            return false;
+        };
+        let directory = self.canonical_dir().to_string_lossy().into_owned();
+        store.import_status(&directory).ok().flatten().as_deref() == Some("failed")
+    }
+
+    #[allow(dead_code)]
+    pub fn project_id(&self) -> Result<String> {
+        Ok(self.open_row()?.1.id)
+    }
+
+    #[allow(dead_code)]
+    pub fn availability(&self) -> Result<String> {
+        Ok(self.open_row()?.1.availability)
+    }
+
     pub fn status(&self) -> Status {
-        read_json::<ProjectState>(&self.state_dir().join("project.json"))
-            .unwrap_or_default()
-            .status
+        match self.open_row() {
+            Ok((_, row)) => match row.lifecycle.as_str() {
+                "paused" => Status::Paused,
+                "archived" | "deleted" => Status::Archived,
+                _ => Status::Active,
+            },
+            Err(_) => Status::Active,
+        }
     }
 
     pub fn set_status(&self, status: Status) -> Result<()> {
         let _lock = self.lock()?;
-        let path = self.state_dir().join("project.json");
-        let state = read_json::<ProjectState>(&path).unwrap_or_default();
-        write_json(&path, &ProjectState { status, ..state })
+        let (store, row) = self.open_row()?;
+        let lifecycle = match status {
+            Status::Active => "active",
+            Status::Paused => "paused",
+            Status::Archived => "archived",
+        };
+        if lifecycle == "archived" {
+            let payload = "{\"lifecycle\":\"archived\"}";
+            store.immediate(|store| {
+                store.set_lifecycle(&row.id, lifecycle)?;
+                let (operation, _) = store.start_intent(&row.id, "archive_project", payload)?;
+                store.finish_operation(&operation, "done", "")?;
+                store.record_event(
+                    &row.id,
+                    "user",
+                    None,
+                    "project.status",
+                    "project",
+                    None,
+                    lifecycle,
+                )?;
+                Ok(())
+            })?;
+            return Ok(());
+        }
+        store.set_lifecycle(&row.id, lifecycle)?;
+        store.record_event(
+            &row.id,
+            "user",
+            None,
+            "project.status",
+            "project",
+            None,
+            lifecycle,
+        )?;
+        Ok(())
     }
 
     /// The slugs this project had before, oldest first.
     pub fn former_slugs(&self) -> Vec<String> {
-        read_json::<ProjectState>(&self.state_dir().join("project.json"))
+        self.open_row()
+            .and_then(|(store, row)| store.former_slugs(&row.id))
             .unwrap_or_default()
-            .former_slugs
     }
 
     /// Records `slug` as a former slug (once).
     pub fn add_former_slug(&self, slug: &str) -> Result<()> {
         let _lock = self.lock()?;
-        let path = self.state_dir().join("project.json");
-        let mut state = read_json::<ProjectState>(&path).unwrap_or_default();
-        if !state.former_slugs.iter().any(|s| s == slug) {
-            state.former_slugs.push(slug.to_string());
-        }
-        write_json(&path, &state)
+        let (store, row) = self.open_row()?;
+        store.add_former_slug(&row.id, slug)
     }
 
     /// The branch prefixes of this project's threads: `hp/<slug>/` for the
     /// slug and for each former one.
     pub fn branch_prefixes(&self) -> Vec<String> {
-        std::iter::once(self.slug.clone()).chain(self.former_slugs()).map(|s| format!("hp/{s}/")).collect()
+        std::iter::once(self.slug.clone())
+            .chain(self.former_slugs())
+            .map(|s| format!("hp/{s}/"))
+            .collect()
     }
 
     pub fn coordinator(&self) -> Option<Coordinator> {
-        read_json(&self.state_dir().join("coordinator.json"))
+        let (store, row) = self.open_row().ok()?;
+        let session = store.primary_session(&row.id).ok()??;
+        Some(coordinator_from_session(&session))
     }
 
-    /// Read-modify-write of `coordinator.json` under the lock: re-reads the
-    /// file, lets `change` touch only the fields its step owns, writes.
+    /// Read-modify-write of the primary session. The pane triple is the
+    /// binding. A cwd match does not select a session.
     pub fn update_coordinator(&self, change: impl FnOnce(&mut Coordinator)) -> Result<Coordinator> {
         let _lock = self.lock()?;
-        let mut record = self.coordinator().unwrap_or_default();
+        let (store, row) = self.open_row()?;
+        let mut record = store
+            .primary_session(&row.id)?
+            .map(|session| coordinator_from_session(&session))
+            .unwrap_or_default();
         change(&mut record);
         record.updated = now();
-        write_json(&self.state_dir().join("coordinator.json"), &record)?;
-        Ok(record)
+        let saved = store.save_primary(&row.id, &draft_from_coordinator(&record))?;
+        Ok(coordinator_from_session(&saved))
     }
 
     pub fn safety(&self, config_dir: &Path) -> Result<Safety> {
         load_safety(config_dir, &self.canonical_dir())
+    }
+}
+
+fn coordinator_from_session(session: &crate::store::SessionRow) -> Coordinator {
+    Coordinator {
+        environment_id: session.environment_id.clone(),
+        socket: session.herdr_socket.clone(),
+        session: session.herdr_session_name.clone(),
+        workspace_id: session.workspace_herdr_id.clone(),
+        tab_id: session.tab_id.clone(),
+        pane_id: session.pane_id.clone(),
+        terminal_id: session.terminal_id.clone(),
+        agent_name: session.agent_name.clone(),
+        cwd: session.cwd.clone(),
+        agent: session.agent_kind.clone(),
+        profile: session.profile.clone(),
+        agent_session: session.agent_session.clone(),
+        updated: String::new(),
+    }
+}
+
+fn draft_from_coordinator(record: &Coordinator) -> SessionDraft {
+    SessionDraft {
+        environment_id: if record.environment_id.is_empty() {
+            ENV_LOCAL.into()
+        } else {
+            record.environment_id.clone()
+        },
+        herdr_socket: record.socket.clone(),
+        pane_id: record.pane_id.clone(),
+        terminal_id: record.terminal_id.clone(),
+        workspace_herdr_id: record.workspace_id.clone(),
+        tab_id: record.tab_id.clone(),
+        agent_name: record.agent_name.clone(),
+        agent_kind: record.agent.clone(),
+        profile: record.profile.clone(),
+        agent_session: record.agent_session.clone(),
+        cwd: record.cwd.clone(),
+        herdr_session_name: record.session.clone(),
     }
 }
 
@@ -443,11 +632,29 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
     let base = Safety::default();
     let yolo = own.yolo.or(default.yolo).unwrap_or(base.yolo);
     Ok(Safety {
-        start_threads: if yolo { "auto".into() } else { own.start_threads.or(default.start_threads).unwrap_or(base.start_threads) },
-        coordinator_agent_args: own.coordinator_agent_args.or(default.coordinator_agent_args).unwrap_or_default(),
-        thread_agent_args: own.thread_agent_args.or(default.thread_agent_args).unwrap_or_default(),
-        routine_commands: own.routine_commands.or(default.routine_commands).unwrap_or(base.routine_commands),
-        trust_screens: own.trust_screens.or(default.trust_screens).unwrap_or_else(|| default_trust_screens(yolo).into()),
+        start_threads: if yolo {
+            "auto".into()
+        } else {
+            own.start_threads
+                .or(default.start_threads)
+                .unwrap_or(base.start_threads)
+        },
+        coordinator_agent_args: own
+            .coordinator_agent_args
+            .or(default.coordinator_agent_args)
+            .unwrap_or_default(),
+        thread_agent_args: own
+            .thread_agent_args
+            .or(default.thread_agent_args)
+            .unwrap_or_default(),
+        routine_commands: own
+            .routine_commands
+            .or(default.routine_commands)
+            .unwrap_or(base.routine_commands),
+        trust_screens: own
+            .trust_screens
+            .or(default.trust_screens)
+            .unwrap_or_else(|| default_trust_screens(yolo).into()),
         yolo,
         thread_profiles: own.thread_profiles.or(default.thread_profiles),
         coordinator_profiles: own.coordinator_profiles.or(default.coordinator_profiles),
@@ -457,12 +664,19 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
 /// Who answers trust screens when `trust_screens` is not set: the
 /// coordinator in yolo mode, the user otherwise.
 pub fn default_trust_screens(yolo: bool) -> &'static str {
-    if yolo { crate::trust_screen::COORDINATOR } else { crate::trust_screen::USER }
+    if yolo {
+        crate::trust_screen::COORDINATOR
+    } else {
+        crate::trust_screen::USER
+    }
 }
 
 /// The `[safety.default]` table and the project's own table, as written.
 /// `canonical_project_dir` empty reads only the default table.
-pub fn load_safety_layers(config_dir: &Path, canonical_project_dir: &Path) -> Result<(SafetyLayer, SafetyLayer)> {
+pub fn load_safety_layers(
+    config_dir: &Path,
+    canonical_project_dir: &Path,
+) -> Result<(SafetyLayer, SafetyLayer)> {
     let file = config_dir.join("config.toml");
     let Ok(text) = std::fs::read_to_string(&file) else {
         return Ok(Default::default());
@@ -471,14 +685,22 @@ pub fn load_safety_layers(config_dir: &Path, canonical_project_dir: &Path) -> Re
 }
 
 /// [`load_safety_layers`] on config.toml's `text`; `file` names it in errors.
-pub fn load_safety_layers_from(text: &str, file: &str, canonical_project_dir: &Path) -> Result<(SafetyLayer, SafetyLayer)> {
+pub fn load_safety_layers_from(
+    text: &str,
+    file: &str,
+    canonical_project_dir: &Path,
+) -> Result<(SafetyLayer, SafetyLayer)> {
     #[derive(Deserialize, Default)]
     struct Config {
         #[serde(default)]
         safety: std::collections::BTreeMap<String, SafetyLayer>,
     }
-    let mut config: Config = toml::from_str(text).with_context(|| format!("{file} does not parse"))?;
-    let default = config.safety.remove(crate::safety::DEFAULT_TABLE).unwrap_or_default();
+    let mut config: Config =
+        toml::from_str(text).with_context(|| format!("{file} does not parse"))?;
+    let default = config
+        .safety
+        .remove(crate::safety::DEFAULT_TABLE)
+        .unwrap_or_default();
     let own = config
         .safety
         .remove(&*canonical_project_dir.to_string_lossy())
@@ -512,6 +734,58 @@ pub fn list_slugs(root: &Path) -> Vec<String> {
         .collect();
     slugs.sort();
     slugs
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedProject {
+    pub slug: String,
+    pub display_name: String,
+}
+
+pub fn resolve_open_name(projects: &[NamedProject], query: &str) -> Result<String> {
+    if validate_slug(query).is_ok() && projects.iter().any(|project| project.slug == query) {
+        return Ok(query.to_string());
+    }
+    let mut matches = projects
+        .iter()
+        .filter(|project| project.display_name == query);
+    let Some(first) = matches.next() else {
+        bail!("no project matches `{query}`");
+    };
+    if matches.next().is_some() {
+        bail!("`{query}` matches more than one project");
+    }
+    Ok(first.slug.clone())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectIndex {
+    pub projects: Vec<crate::store::ProjectRow>,
+    pub failed_imports: Vec<(String, String)>,
+}
+
+pub fn import_and_list(root: &Path) -> Result<ProjectIndex> {
+    let store = Store::open(root)?;
+    for slug in list_slugs(root) {
+        let project = Project::load(root, &slug)?;
+        if let Err(error) = project.open_row() {
+            let directory = project.canonical_dir().to_string_lossy().into_owned();
+            let known = store.project_by_slug(&slug)?.is_some();
+            let status = store.import_status(&directory)?;
+            if !known && status.as_deref() != Some("failed") {
+                store.note_import(&directory, "failed", &error.to_string(), None)?;
+            }
+        }
+    }
+    for row in store.list_projects()? {
+        if !Path::new(&row.directory).join("PROJECT.md").is_file() {
+            let _ = Project::load(root, &row.slug);
+        }
+    }
+    Ok(ProjectIndex {
+        projects: store.list_projects()?,
+        failed_imports: store.failed_imports()?,
+    })
 }
 
 /// `PATH[@MACHINE]` as given to `new --repo`.
@@ -550,7 +824,17 @@ popup or by asking the coordinator.
 
 /// The folders every project has. `uploads/` is yours (files for threads),
 /// `library/` holds what threads produced.
-pub const SUBDIRS: [&str; 9] = ["memory", "scratch", "routines", "threads", "inbox", "inbox/done", "library", "uploads", ".state"];
+pub const SUBDIRS: [&str; 9] = [
+    "memory",
+    "scratch",
+    "routines",
+    "threads",
+    "inbox",
+    "inbox/done",
+    "library",
+    "uploads",
+    ".state",
+];
 
 /// The text of `AGENTS.md`. Harnesses load it from every ancestor of their
 /// working directory, and tab threads run under `threads/<id>/`, so it says
@@ -568,7 +852,9 @@ pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
 /// The command prefix `AGENTS.md` carries, so `doctor` can check that its
 /// binary still exists.
 pub fn prefix_in_agents_md(text: &str) -> Option<String> {
-    let line = text.lines().find(|l| l.starts_with("If your working directory is exactly this folder"))?;
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("If your working directory is exactly this folder"))?;
     let start = line.find('`')? + 1;
     let rest = &line[start..];
     let end = rest.find(" skill`")?;
@@ -620,7 +906,8 @@ pub fn write_priming(project: &Project, prefix: &str) -> Result<()> {
                 std::fs::remove_file(&claude)?;
             }
         }
-        std::os::unix::fs::symlink("AGENTS.md", &claude).with_context(|| format!("could not link {}", claude.display()))?;
+        std::os::unix::fs::symlink("AGENTS.md", &claude)
+            .with_context(|| format!("could not link {}", claude.display()))?;
     }
     if !dir.join("uploads").is_dir() {
         std::fs::create_dir(dir.join("uploads"))?;
@@ -638,9 +925,15 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
         Ok(text) => match prefix_in_agents_md(&text) {
             None => problems.push("AGENTS.md does not name the binary".into()),
             Some(found) => {
-                let binary = found.split(" --root ").next().unwrap_or("").trim_matches('\'');
+                let binary = found
+                    .split(" --root ")
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches('\'');
                 if !Path::new(binary).is_file() {
-                    problems.push(format!("AGENTS.md points at a binary that does not exist ({binary})"));
+                    problems.push(format!(
+                        "AGENTS.md points at a binary that does not exist ({binary})"
+                    ));
                 } else if found != prefix {
                     problems.push("AGENTS.md names another binary or root than this one".into());
                 }
@@ -663,18 +956,16 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
 /// project's directories. Fails if the slug exists.
 pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<Project> {
     let slug = slug_from_name(name)?;
+    std::fs::create_dir_all(root)?;
+    let root = std::fs::canonicalize(root)?;
     let project = Project {
-        root: root.to_path_buf(),
+        root: root.clone(),
         slug: slug.clone(),
     };
-    let dir = project.dir();
-    if dir.exists() {
-        bail!("`{slug}` already exists in {}", root.display());
-    }
+    let directory = project.dir();
     let repos = repos
         .into_iter()
         .map(|repo| match repo.machine {
-            // A remote path is stored as it is on its own machine.
             Some(_) => repo,
             None => Repo {
                 path: std::fs::canonicalize(&repo.path)
@@ -691,10 +982,286 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
         repos,
         ..Settings::default()
     };
-    let front = toml::to_string(&settings)?;
+    let payload = serde_json::json!({
+        "slug": slug,
+        "directory": directory,
+        "name": settings.name,
+        "goal": settings.goal,
+        "repos": settings.repos,
+    })
+    .to_string();
+    let store = Store::open(&root)?;
+    if let Some(row) = store.project_by_slug(&slug)? {
+        if store.pending_kind(&row.id, "create_project")?.is_some() {
+            write_created_files(&project, &settings)?;
+            if let Some(operation) = Store::open(&root)?.pending_kind(&row.id, "create_project")? {
+                Store::open(&root)?.finish_operation(&operation.id, "done", "")?;
+            }
+            return Ok(project);
+        }
+        bail!("`{slug}` already exists in {}", root.display());
+    }
+    if directory.exists() {
+        bail!("`{slug}` already exists in {}", root.display());
+    }
+    let row = store.immediate(|store| {
+        let row = store.insert_project(&slug, &directory.to_string_lossy(), "active")?;
+        store.start_intent(&row.id, "create_project", &payload)?;
+        Ok(row)
+    })?;
+    write_created_files(&project, &settings)?;
+    if let Some(operation) = Store::open(&root)?.pending_kind(&row.id, "create_project")? {
+        Store::open(&root)?.finish_operation(&operation.id, "done", "")?;
+    }
+    Ok(project)
+}
 
-    std::fs::create_dir_all(root)?;
-    std::fs::create_dir(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+pub struct NewProject {
+    pub name: String,
+    pub goal: String,
+    pub repos: Vec<Repo>,
+    pub thread_profile: String,
+    pub coordinator_profile: String,
+    pub prefix: String,
+}
+
+pub fn create_with_setup(root: &Path, spec: &NewProject) -> Result<Project> {
+    let project = create(root, &spec.name, &spec.goal, spec.repos.clone())?;
+    begin_setup(&project, &spec.thread_profile, &spec.coordinator_profile)?;
+    finish_setup(&project, &spec.prefix)
+        .with_context(|| format!("`{}` was created; setup is incomplete", project.slug))?;
+    Ok(project)
+}
+
+fn begin_setup(project: &Project, thread: &str, coordinator: &str) -> Result<()> {
+    let (store, row) = project.open_row()?;
+    if store.latest_kind(&row.id, "write_defaults")?.is_none() {
+        let payload = serde_json::json!({
+            "intent": "write_defaults",
+            "thread_profile": thread,
+            "coordinator_profile": coordinator,
+        })
+        .to_string();
+        store.start_intent(&row.id, "write_defaults", &payload)?;
+    }
+    if store.latest_kind(&row.id, "write_priming")?.is_none() {
+        store.start_intent(&row.id, "write_priming", r#"{"intent":"write_priming"}"#)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct SetupIntervention {
+    pub path: String,
+}
+
+impl std::fmt::Display for SetupIntervention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "setup is incomplete: {} was changed; Finish setup will not overwrite it",
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for SetupIntervention {}
+
+pub fn finish_setup(project: &Project, prefix: &str) -> Result<()> {
+    let (store, row) = project.open_row()?;
+    if let Some(op) = store.latest_kind(&row.id, "write_defaults")?
+        && op.status != "done"
+    {
+        reconcile_defaults(&store, project, &op)?;
+    }
+    if let Some(op) = store.latest_kind(&row.id, "write_priming")? {
+        if op.status != "done" {
+            reconcile_priming(&store, project, &op, prefix)?;
+        }
+    } else if !project.dir().join("AGENTS.md").exists() {
+        recover_priming(project, prefix)?;
+    }
+    Ok(())
+}
+
+fn reconcile_defaults(
+    store: &Store,
+    project: &Project,
+    op: &crate::store::OperationRow,
+) -> Result<()> {
+    let value: serde_json::Value =
+        serde_json::from_str(&op.payload).context("write_defaults payload does not parse")?;
+    let thread = value["thread_profile"].as_str().unwrap_or("claude");
+    let coordinator = value["coordinator_profile"].as_str().unwrap_or("claude");
+    let (settings, _) = project.read_project_md()?;
+    let matches = settings.thread_profile == thread && settings.coordinator_profile == coordinator;
+    if matches {
+        store.finish_operation(&op.id, "done", "")?;
+        return Ok(());
+    }
+    let skeleton = settings.thread_profile == Settings::default().thread_profile
+        && settings.coordinator_profile == Settings::default().coordinator_profile;
+    let text = std::fs::read_to_string(project.project_md()).unwrap_or_default();
+    let keys_missing = !profile_keys_present(&text);
+    if skeleton || keys_missing {
+        crate::profiles::write_project_defaults(project, thread, coordinator)?;
+        store.finish_operation(&op.id, "done", "")?;
+        return Ok(());
+    }
+    Err(SetupIntervention {
+        path: "PROJECT.md".into(),
+    }
+    .into())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimingFile {
+    Missing,
+    Expected,
+    UserOwned,
+    Unreadable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimingChoice {
+    Create,
+    Recognize,
+    Intervene { path: &'static str },
+}
+
+fn priming_decision(agents: PrimingFile, claude: PrimingFile) -> PrimingChoice {
+    match agents {
+        PrimingFile::UserOwned | PrimingFile::Unreadable => {
+            PrimingChoice::Intervene { path: "AGENTS.md" }
+        }
+        PrimingFile::Missing => match claude {
+            PrimingFile::Missing | PrimingFile::Expected => PrimingChoice::Create,
+            PrimingFile::UserOwned | PrimingFile::Unreadable => {
+                PrimingChoice::Intervene { path: "CLAUDE.md" }
+            }
+        },
+        PrimingFile::Expected => match claude {
+            PrimingFile::Missing | PrimingFile::Expected => PrimingChoice::Recognize,
+            PrimingFile::UserOwned | PrimingFile::Unreadable => {
+                PrimingChoice::Intervene { path: "CLAUDE.md" }
+            }
+        },
+    }
+}
+
+fn classify_agents(path: &Path, expected: &str) -> PrimingFile {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PrimingFile::Missing,
+        Err(_) => PrimingFile::Unreadable,
+        Ok(_) => match std::fs::read_to_string(path) {
+            Ok(text) if text == expected => PrimingFile::Expected,
+            Ok(_) => PrimingFile::UserOwned,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PrimingFile::Missing,
+            Err(_) => PrimingFile::Unreadable,
+        },
+    }
+}
+
+fn classify_claude(path: &Path) -> PrimingFile {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PrimingFile::Missing,
+        Err(_) => PrimingFile::Unreadable,
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(path) {
+            Ok(target) if target == Path::new("AGENTS.md") => PrimingFile::Expected,
+            Ok(_) => PrimingFile::UserOwned,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PrimingFile::Missing,
+            Err(_) => PrimingFile::Unreadable,
+        },
+        Ok(_) => PrimingFile::UserOwned,
+    }
+}
+
+fn recover_priming(project: &Project, prefix: &str) -> Result<()> {
+    let (settings, _) = project.read_project_md()?;
+    let name = display_name(&settings.name, &project.slug);
+    let expected = agents_md(&name, &project.slug, prefix);
+    let dir = project.dir();
+    let agents_path = dir.join("AGENTS.md");
+    let claude_path = dir.join("CLAUDE.md");
+    let agents = classify_agents(&agents_path, &expected);
+    let claude = classify_claude(&claude_path);
+    if let PrimingChoice::Intervene { path } = priming_decision(agents, claude) {
+        return Err(SetupIntervention { path: path.into() }.into());
+    }
+    let agents = classify_agents(&agents_path, &expected);
+    let claude = classify_claude(&claude_path);
+    if let PrimingChoice::Intervene { path } = priming_decision(agents, claude) {
+        return Err(SetupIntervention { path: path.into() }.into());
+    }
+    if agents == PrimingFile::Missing {
+        write_atomic(&agents_path, expected.as_bytes())?;
+    }
+    if claude == PrimingFile::Missing {
+        std::os::unix::fs::symlink("AGENTS.md", &claude_path)
+            .with_context(|| format!("could not link {}", claude_path.display()))?;
+    }
+    let uploads = dir.join("uploads");
+    if !uploads.exists() {
+        std::fs::create_dir(&uploads)?;
+    }
+    write_default_routine(project)?;
+    Ok(())
+}
+
+fn reconcile_priming(
+    store: &Store,
+    project: &Project,
+    op: &crate::store::OperationRow,
+    prefix: &str,
+) -> Result<()> {
+    recover_priming(project, prefix)?;
+    store.finish_operation(&op.id, "done", "")?;
+    Ok(())
+}
+
+fn profile_keys_present(text: &str) -> bool {
+    let Some(front) = text.strip_prefix("+++\n").and_then(|rest| {
+        rest.split_once("\n+++\n")
+            .map(|(front, _)| front)
+            .or_else(|| rest.strip_suffix("\n+++"))
+    }) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(front) else {
+        return false;
+    };
+    let Some(table) = value.as_table() else {
+        return false;
+    };
+    (table.contains_key("thread_profile") || table.contains_key("thread_agent"))
+        && (table.contains_key("coordinator_profile") || table.contains_key("coordinator_agent"))
+}
+
+pub fn setup_incomplete(project: &Project) -> Result<bool> {
+    let (store, row) = project.open_row()?;
+    for kind in ["write_defaults", "write_priming"] {
+        if let Some(op) = store.latest_kind(&row.id, kind)?
+            && op.status != "done"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn write_created_files(project: &Project, settings: &Settings) -> Result<()> {
+    if project.project_md().is_file()
+        && std::fs::read_to_string(project.project_md())
+            .ok()
+            .is_some_and(|text| parse_project_md(&text).is_ok())
+    {
+        return Ok(());
+    }
+    let front = toml::to_string(settings)?;
+    let dir = project.dir();
+    std::fs::create_dir(&dir)
+        .or_else(|error| if dir.is_dir() { Ok(()) } else { Err(error) })
+        .with_context(|| format!("could not create {}", dir.display()))?;
     for sub in SUBDIRS {
         std::fs::create_dir_all(dir.join(sub))?;
     }
@@ -704,14 +1271,11 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
     )?;
     write_atomic(&dir.join("TASKS.md"), TASKS_TEMPLATE.as_bytes())?;
     write_atomic(&dir.join(PR_FOLLOWUP), PR_FOLLOWUP_TEMPLATE.as_bytes())?;
-    write_json(&project.state_dir().join("project.json"), &ProjectState::default())?;
-    // PROJECT.md last: a folder without it is not a project, so a half-made
-    // skeleton is never picked up by `list` or the ticker.
     write_atomic(
         &project.project_md(),
         format!("+++\n{front}+++\n\n{INSTRUCTIONS_TEMPLATE}").as_bytes(),
     )?;
-    Ok(project)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -736,7 +1300,18 @@ mod tests {
         for good in ["a", "demo", "demo-2", "0x", &"a".repeat(40)] {
             assert!(validate_slug(good).is_ok(), "{good}");
         }
-        for bad in ["", "-a", "A", "a_b", "a/b", "../x", "a b", ".", "..", &"a".repeat(41)] {
+        for bad in [
+            "",
+            "-a",
+            "A",
+            "a_b",
+            "a/b",
+            "../x",
+            "a b",
+            ".",
+            "..",
+            &"a".repeat(41),
+        ] {
             assert!(validate_slug(bad).is_err(), "{bad}");
         }
     }
@@ -746,12 +1321,391 @@ mod tests {
         assert_eq!(humanize("herdr-projects"), "Herdr Projects");
         assert_eq!(humanize("gtm_ai"), "Gtm Ai");
         assert_eq!(humanize("-v2--api-"), "V2 Api");
-        assert_eq!(display_name("herdr-projects", "herdr-projects"), "Herdr Projects");
+        assert_eq!(
+            display_name("herdr-projects", "herdr-projects"),
+            "Herdr Projects"
+        );
         assert_eq!(display_name("", "herdr-projects"), "Herdr Projects");
         assert_eq!(display_name("  ", "demo"), "Demo");
         for typed in ["GTM AI", "my project", "Demo", "herdr-Projects"] {
             assert_eq!(display_name(typed, "x"), typed);
         }
+    }
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dest = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_frozen_v0_2_34_tree_imports_its_fields_and_keeps_the_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/legacy-v0.2.34/basic");
+        copy_tree(&fixture, &root.path().join("basic"));
+        let state = root.path().join("basic/.state/project.json");
+        let before = std::fs::read(&state).unwrap();
+        let project = Project::load(root.path(), "basic").unwrap();
+        assert_eq!(project.status(), Status::Paused);
+        assert_eq!(project.former_slugs(), ["old-name"]);
+        assert_eq!(project.coordinator().unwrap().pane_id, "w1:p1");
+        assert_eq!(
+            crate::thread::load(&project, "t-0001").unwrap().title,
+            "Keep"
+        );
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        let mixed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/legacy-v0.2.34/one-bad-thread");
+        copy_tree(&mixed, &root.path().join("mixed"));
+        let mixed_project = Project::load(root.path(), "mixed").unwrap();
+        assert_eq!(
+            crate::thread::load(&mixed_project, "t-0001").unwrap().title,
+            "Good"
+        );
+        assert!(crate::thread::load(&mixed_project, "t-0002").is_err());
+    }
+
+    #[test]
+    fn a_pending_create_resumes_once_and_a_pending_rename_keeps_one_id() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path()).unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let directory = root.path().join("demo");
+        let row = store
+            .insert_project("demo", &directory.to_string_lossy(), "active")
+            .unwrap();
+        let payload = serde_json::json!({
+            "slug": "demo",
+            "directory": directory,
+            "name": "Demo",
+            "goal": "",
+            "repos": []
+        })
+        .to_string();
+        store
+            .start_intent(&row.id, "create_project", &payload)
+            .unwrap();
+        let project = create(root.path(), "Demo", "", vec![]).unwrap();
+        assert!(project.project_md().is_file());
+        assert_eq!(project.project_id().unwrap(), row.id);
+        assert!(create(root.path(), "Demo", "", vec![]).is_err());
+        let id = project.project_id().unwrap();
+        let (store, current) = project.open_row().unwrap();
+        store.reserve_slug(&current.id, "omega").unwrap();
+        let new_directory = root.path().join("omega");
+        let rename_payload = serde_json::json!({
+            "from": "demo",
+            "to": "omega",
+            "old_directory": current.directory,
+            "new_directory": new_directory,
+        })
+        .to_string();
+        store
+            .start_intent(&current.id, "rename_project", &rename_payload)
+            .unwrap();
+        std::fs::rename(project.dir(), &new_directory).unwrap();
+        let again = Project::load(root.path(), "omega").unwrap();
+        assert_eq!(again.project_id().unwrap(), id);
+        assert_eq!(store.project_by_slug("omega").unwrap().unwrap().id, id);
+        assert!(
+            Store::open(root.path())
+                .unwrap()
+                .project_by_slug("demo")
+                .unwrap()
+                .is_none()
+                || again.former_slugs().iter().any(|slug| slug == "demo")
+        );
+    }
+
+    #[test]
+    fn a_changed_repo_list_keeps_the_remaining_id() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "", vec![]).unwrap();
+        let write = |body: &str| {
+            std::fs::write(project.project_md(), body).unwrap();
+        };
+        write(
+            "+++\nname = \"Demo\"\n[[repos]]\npath = \"/repos/one\"\n[[repos]]\npath = \"/repos/two\"\n+++\n",
+        );
+        assert!(project.reconcile_repositories().unwrap());
+        let (store, row) = project.open_row().unwrap();
+        let rows = store.repos(&row.id).unwrap();
+        let one = rows
+            .iter()
+            .find(|repo| repo.path == "/repos/one")
+            .unwrap()
+            .id
+            .clone();
+        let two = rows
+            .iter()
+            .find(|repo| repo.path == "/repos/two")
+            .unwrap()
+            .id
+            .clone();
+        write(
+            "+++\nname = \"Demo\"\n[[repos]]\npath = \"/repos/two\"\n[[repos]]\npath = \"/repos/one\"\n+++\n",
+        );
+        assert!(!project.reconcile_repositories().unwrap());
+        write("+++\nname = \"Demo\"\n[[repos]]\npath = \"/repos/one\"\n+++\n");
+        assert!(project.reconcile_repositories().unwrap());
+        let rows = store.repos(&row.id).unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|repo| repo.path == "/repos/one")
+                .unwrap()
+                .id,
+            one
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|repo| repo.path == "/repos/one")
+                .unwrap()
+                .removed
+        );
+        let removed = rows.iter().find(|repo| repo.path == "/repos/two").unwrap();
+        assert_eq!(removed.id, two);
+        assert!(removed.removed);
+        write(
+            "+++\nname = \"Demo\"\n[[repos]]\npath = \"/repos/one\"\n[[repos]]\npath = \"/repos/two\"\n+++\n",
+        );
+        assert!(project.reconcile_repositories().unwrap());
+        let rows = store.repos(&row.id).unwrap();
+        let restored = rows.iter().find(|repo| repo.path == "/repos/two").unwrap();
+        assert_eq!(restored.id, two);
+        assert!(!restored.removed);
+    }
+
+    #[test]
+    fn poisoned_legacy_files_do_not_override_the_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "Ship", vec![]).unwrap();
+        assert_eq!(project.status(), Status::Active);
+        let thread = crate::thread::allocate(&project, |t| t.title = "Keep".into()).unwrap();
+        project
+            .update_coordinator(|c| {
+                c.socket = "/sock".into();
+                c.pane_id = "w1:p1".into();
+                c.cwd = project.dir().to_string_lossy().into_owned();
+            })
+            .unwrap();
+        std::fs::write(
+            project.state_dir().join("project.json"),
+            r#"{"status":"archived","former_slugs":["bogus"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.state_dir().join("coordinator.json"),
+            r#"{"socket":"/other","pane_id":"w9:p9","cwd":"/nope"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.dir().join("threads/t-0001.toml"),
+            "id = \"t-0001\"\ntitle = \"LIE\"\nstatus = \"resolved\"\npane_id = \"w9:p9\"\nbranch = \"nope\"\nprofile = \"evil\"\ncwd = \"/lie\"\n",
+        )
+        .unwrap();
+        assert_eq!(project.status(), Status::Active);
+        assert!(project.former_slugs().is_empty());
+        assert_eq!(
+            crate::thread::load(&project, &thread.id).unwrap().title,
+            "Keep"
+        );
+        assert_eq!(project.coordinator().unwrap().pane_id, "w1:p1");
+        std::fs::remove_file(project.state_dir().join("project.json")).unwrap();
+        std::fs::remove_file(project.state_dir().join("coordinator.json")).unwrap();
+        std::fs::remove_file(project.dir().join("threads/t-0001.toml")).unwrap();
+        assert_eq!(project.status(), Status::Active);
+        assert_eq!(
+            crate::thread::load(&project, &thread.id).unwrap().title,
+            "Keep"
+        );
+        assert_eq!(project.coordinator().unwrap().socket, "/sock");
+    }
+
+    fn file_hash(path: &std::path::Path) -> String {
+        use sha2::Digest;
+        let bytes = std::fs::read(path).unwrap();
+        let digest = sha2::Sha256::digest(&bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn legacy_import_keeps_fields_and_later_writes_do_not_touch_the_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("demo");
+        std::fs::create_dir_all(dir.join(".state")).unwrap();
+        std::fs::create_dir_all(dir.join("threads")).unwrap();
+        std::fs::write(
+            dir.join("PROJECT.md"),
+            "+++\nname = \"Demo\"\ngoal = \"Ship\"\n+++\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("MEMORY.md"), "# Memory\n").unwrap();
+        std::fs::write(dir.join("TASKS.md"), "# Tasks\n").unwrap();
+        let project = Project::load(root.path(), "demo").unwrap();
+        let state = project.state_dir().join("project.json");
+        let coordinator = project.state_dir().join("coordinator.json");
+        let record = project.dir().join("threads/t-0001.toml");
+        let task = project.dir().join("threads/t-0001.task.md");
+        std::fs::write(
+            &state,
+            "{\"status\":\"paused\",\"former_slugs\":[\"old-name\"]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &coordinator,
+            "{\"socket\":\"/sock\",\"pane_id\":\"w1:p1\",\"cwd\":\"/keep\",\"agent\":\"claude\",\"profile\":\"claude\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &record,
+            "id = \"t-0001\"\ntitle = \"Keep\"\nstatus = \"open\"\nkind = \"worktree\"\nbranch = \"hp/demo/t-0001-keep\"\nbase = \"main\"\nprofile = \"claude\"\ncwd = \"/wt\"\nworktree_path = \"/wt\"\npane_id = \"w2:p1\"\npr = \"https://github.com/acme/app/pull/4\"\n",
+        )
+        .unwrap();
+        std::fs::write(&task, "do the work\n").unwrap();
+        let before = [
+            file_hash(&state),
+            file_hash(&coordinator),
+            file_hash(&record),
+        ];
+
+        assert_eq!(project.status(), Status::Paused);
+        assert_eq!(project.former_slugs(), ["old-name"]);
+        let bound = project.coordinator().unwrap();
+        assert_eq!(bound.socket, "/sock");
+        assert_eq!(bound.pane_id, "w1:p1");
+        assert_eq!(bound.profile, "claude");
+        let thread = crate::thread::load(&project, "t-0001").unwrap();
+        assert_eq!(thread.title, "Keep");
+        assert_eq!(thread.branch, "hp/demo/t-0001-keep");
+        assert_eq!(thread.base, "main");
+        assert_eq!(thread.pr, "https://github.com/acme/app/pull/4");
+        assert_eq!(thread.cwd, "/wt");
+        assert_eq!(
+            [
+                file_hash(&state),
+                file_hash(&coordinator),
+                file_hash(&record)
+            ],
+            before
+        );
+        let id = project.project_id().unwrap();
+
+        std::fs::write(
+            &state,
+            "{\"status\":\"archived\",\"former_slugs\":[\"bogus\"]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &coordinator,
+            "{\"socket\":\"/other\",\"pane_id\":\"w9:p9\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &record,
+            "id = \"t-0001\"\ntitle = \"LIE\"\nstatus = \"resolved\"\n",
+        )
+        .unwrap();
+        let poisoned = [
+            file_hash(&state),
+            file_hash(&coordinator),
+            file_hash(&record),
+        ];
+        assert_ne!(poisoned, before);
+        assert_eq!(project.status(), Status::Paused);
+        assert_eq!(project.former_slugs(), ["old-name"]);
+        assert_eq!(project.coordinator().unwrap().pane_id, "w1:p1");
+        assert_eq!(
+            crate::thread::load(&project, "t-0001").unwrap().title,
+            "Keep"
+        );
+
+        project.set_status(Status::Active).unwrap();
+        project
+            .update_coordinator(|record| record.agent_name = "renamed".into())
+            .unwrap();
+        crate::thread::update(&project, "t-0001", |thread| thread.title = "Next".into()).unwrap();
+        assert_eq!(
+            [
+                file_hash(&state),
+                file_hash(&coordinator),
+                file_hash(&record)
+            ],
+            poisoned
+        );
+        std::fs::remove_file(&state).unwrap();
+        std::fs::remove_file(&coordinator).unwrap();
+        std::fs::remove_file(&record).unwrap();
+        let again = Project::load(root.path(), "demo").unwrap();
+        assert_eq!(again.project_id().unwrap(), id);
+        assert_eq!(again.status(), Status::Active);
+        assert_eq!(crate::thread::load(&again, "t-0001").unwrap().title, "Next");
+        assert_eq!(again.coordinator().unwrap().agent_name, "renamed");
+        assert_eq!(again.coordinator().unwrap().pane_id, "w1:p1");
+        assert_eq!(std::fs::read_to_string(&task).unwrap(), "do the work\n");
+        assert!(again.project_md().is_file());
+        assert!(again.dir().join("MEMORY.md").is_file());
+        assert!(again.dir().join("TASKS.md").is_file());
+    }
+
+    #[test]
+    fn a_bad_project_json_stays_failed_until_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("demo");
+        std::fs::create_dir_all(dir.join(".state")).unwrap();
+        std::fs::write(dir.join("PROJECT.md"), "+++\nname = \"Demo\"\n+++\n").unwrap();
+        let project = Project::load(root.path(), "demo").unwrap();
+        std::fs::write(project.state_dir().join("project.json"), "{").unwrap();
+        assert!(project.open_row().is_err());
+        assert!(project.import_failed());
+        std::fs::write(
+            project.state_dir().join("project.json"),
+            "{\"status\":\"paused\",\"former_slugs\":[\"old\"]}\n",
+        )
+        .unwrap();
+        assert!(project.open_row().is_err());
+        Store::open(root.path())
+            .unwrap()
+            .forget_failed_imports()
+            .unwrap();
+        assert_eq!(project.status(), Status::Paused);
+        assert_eq!(project.former_slugs(), ["old"]);
+    }
+
+    #[test]
+    fn one_bad_thread_file_does_not_drop_the_valid_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::write(
+            project.dir().join("threads/t-0001.toml"),
+            "id = \"t-0001\"\ntitle = \"Good\"\nstatus = \"open\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.dir().join("threads/t-0002.toml"), "not = toml =").unwrap();
+        let titles: Vec<_> = crate::thread::list(&project)
+            .into_iter()
+            .map(|thread| thread.title)
+            .collect();
+        assert_eq!(titles, ["Good"]);
+        std::fs::write(
+            project.dir().join("threads/t-0002.toml"),
+            "id = \"t-0002\"\ntitle = \"Also\"\nstatus = \"failed\"\n",
+        )
+        .unwrap();
+        let mut titles: Vec<_> = crate::thread::list(&project)
+            .into_iter()
+            .map(|thread| thread.title)
+            .collect();
+        titles.sort();
+        assert_eq!(titles, ["Also", "Good"]);
     }
 
     #[test]
@@ -767,7 +1721,10 @@ mod tests {
 
     #[test]
     fn slug_derivation_and_name_refusals() {
-        assert_eq!(slug_from_name("My Demo  Project!").unwrap(), "my-demo-project");
+        assert_eq!(
+            slug_from_name("My Demo  Project!").unwrap(),
+            "my-demo-project"
+        );
         assert_eq!(slug_from_name("  Ünï 42 ").unwrap(), "n-42");
         assert_eq!(slug_from_name(&"x".repeat(60)).unwrap().len(), 40);
         for bad in ["../x", "a/b", "a\\b", "..", "!!!", ""] {
@@ -783,11 +1740,23 @@ mod tests {
             &root,
             "Demo",
             "Ship \"it\"",
-            vec![parse_repo_arg("/srv/app@box"), parse_repo_arg("/no/such/repo")],
+            vec![
+                parse_repo_arg("/srv/app@box"),
+                parse_repo_arg("/no/such/repo"),
+            ],
         )
         .unwrap();
         assert_eq!(project.slug, "demo");
-        for sub in ["memory", "scratch", "routines", "threads", "inbox/done", "library", "uploads", ".state"] {
+        for sub in [
+            "memory",
+            "scratch",
+            "routines",
+            "threads",
+            "inbox/done",
+            "library",
+            "uploads",
+            ".state",
+        ] {
             assert!(project.dir().join(sub).is_dir(), "{sub}");
         }
         assert!(project.dir().join("MEMORY.md").is_file());
@@ -800,12 +1769,21 @@ mod tests {
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert!(project.dir().join(PR_FOLLOWUP).is_file());
-        assert!(crate::routine::load_all(&project).1.is_empty(), "the default routine parses");
+        assert!(
+            crate::routine::load_all(&project).1.is_empty(),
+            "the default routine parses"
+        );
         assert_eq!(
             settings.repos,
             vec![
-                Repo { path: "/srv/app".into(), machine: Some("box".into()) },
-                Repo { path: "/no/such/repo".into(), machine: None },
+                Repo {
+                    path: "/srv/app".into(),
+                    machine: Some("box".into())
+                },
+                Repo {
+                    path: "/no/such/repo".into(),
+                    machine: None
+                },
             ]
         );
         assert!(body.starts_with("# Instructions"));
@@ -817,7 +1795,11 @@ mod tests {
     fn priming_files_are_written_linked_and_checked() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "Demo Project", "", vec![]).unwrap();
-        let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
+        let prefix = format!(
+            "{} --root {}",
+            std::env::current_exe().unwrap().display(),
+            root.path().display()
+        );
         write_priming(&project, &prefix).unwrap();
         let text = std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap();
         assert!(text.contains("you are the coordinator of Demo Project"));
@@ -825,7 +1807,10 @@ mod tests {
         assert!(text.contains(&format!("`{prefix} context demo-project`")));
         assert!(text.contains("under `threads/`, you are a thread"));
         assert_eq!(prefix_in_agents_md(&text).as_deref(), Some(prefix.as_str()));
-        assert_eq!(std::fs::read_link(project.dir().join("CLAUDE.md")).unwrap(), Path::new("AGENTS.md"));
+        assert_eq!(
+            std::fs::read_link(project.dir().join("CLAUDE.md")).unwrap(),
+            Path::new("AGENTS.md")
+        );
         assert!(project.dir().join("uploads").is_dir());
         assert!(priming_problems(&project, &prefix).is_empty());
 
@@ -842,13 +1827,23 @@ mod tests {
         // A foreign AGENTS.md is kept beside ours.
         std::fs::write(project.dir().join("AGENTS.md"), "codex notes").unwrap();
         write_priming(&project, &prefix).unwrap();
-        assert_eq!(std::fs::read_to_string(project.dir().join("AGENTS.md.before-herdr-projects")).unwrap(), "codex notes");
+        assert_eq!(
+            std::fs::read_to_string(project.dir().join("AGENTS.md.before-herdr-projects")).unwrap(),
+            "codex notes"
+        );
         // A hand-written CLAUDE.md is kept beside the link, not lost.
         std::fs::remove_file(project.dir().join("CLAUDE.md")).unwrap();
         std::fs::write(project.dir().join("CLAUDE.md"), "mine").unwrap();
-        assert!(priming_problems(&project, &prefix).iter().any(|p| p.contains("CLAUDE.md")));
+        assert!(
+            priming_problems(&project, &prefix)
+                .iter()
+                .any(|p| p.contains("CLAUDE.md"))
+        );
         write_priming(&project, &prefix).unwrap();
-        assert_eq!(std::fs::read_to_string(project.dir().join("CLAUDE.md.before-herdr-projects")).unwrap(), "mine");
+        assert_eq!(
+            std::fs::read_to_string(project.dir().join("CLAUDE.md.before-herdr-projects")).unwrap(),
+            "mine"
+        );
         assert!(priming_problems(&project, &prefix).is_empty());
     }
 
@@ -918,16 +1913,35 @@ mod tests {
         let safety = load_safety(config.path(), here).unwrap();
         assert!(safety.yolo, "inherited from the default table");
         assert_eq!(safety.start_threads, "auto", "yolo wins over propose");
-        assert!(safety.thread_agent_args.is_empty(), "the project's own empty list wins");
+        assert!(
+            safety.thread_agent_args.is_empty(),
+            "the project's own empty list wins"
+        );
         let other = load_safety(config.path(), Path::new("/projects/other")).unwrap();
-        assert_eq!((other.yolo, other.thread_agent_args), (true, vec!["--a".to_string()]));
+        assert_eq!(
+            (other.yolo, other.thread_agent_args),
+            (true, vec!["--a".to_string()])
+        );
 
         let args = safety.launch_args("claude", &["--model".into(), "opus".into()]);
         assert_eq!(args, ["--model", "opus", "--dangerously-skip-permissions"]);
-        assert_eq!(safety.launch_args("codex", &[]), ["--dangerously-bypass-approvals-and-sandbox"]);
-        assert_eq!(safety.launch_args("claude", &["--dangerously-skip-permissions".into()]), ["--dangerously-skip-permissions"], "not twice");
-        assert!(safety.launch_args("kiro", &[]).is_empty(), "no known flag: nothing added");
-        assert!(Safety::default().launch_args("claude", &[]).is_empty(), "careful mode adds nothing");
+        assert_eq!(
+            safety.launch_args("codex", &[]),
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert_eq!(
+            safety.launch_args("claude", &["--dangerously-skip-permissions".into()]),
+            ["--dangerously-skip-permissions"],
+            "not twice"
+        );
+        assert!(
+            safety.launch_args("kiro", &[]).is_empty(),
+            "no known flag: nothing added"
+        );
+        assert!(
+            Safety::default().launch_args("claude", &[]).is_empty(),
+            "careful mode adds nothing"
+        );
     }
 
     #[test]
@@ -935,7 +1949,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "", vec![]).unwrap();
         std::fs::remove_file(project.project_md()).unwrap();
-        assert!(project.update_coordinator(|c| c.pane_id = "w1:p1".into()).is_err());
+        assert!(
+            project
+                .update_coordinator(|c| c.pane_id = "w1:p1".into())
+                .is_err()
+        );
         assert!(project.coordinator().is_none());
 
         // A deleted folder is not recreated by taking the lock.
@@ -948,14 +1966,307 @@ mod tests {
     fn coordinator_updates_keep_other_fields() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "", vec![]).unwrap();
-        project.update_coordinator(|c| c.socket = "/s".into()).unwrap();
-        project.update_coordinator(|c| c.agent_session = "sess".into()).unwrap();
+        project
+            .update_coordinator(|c| c.socket = "/s".into())
+            .unwrap();
+        project
+            .update_coordinator(|c| c.agent_session = "sess".into())
+            .unwrap();
         let record = project.coordinator().unwrap();
         assert_eq!(record.socket, "/s");
         assert_eq!(record.agent_session, "sess");
-        assert!(std::fs::read_dir(project.state_dir())
-            .unwrap()
-            .flatten()
-            .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(
+            std::fs::read_dir(project.state_dir())
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+    }
+
+    fn project_md(name: &str) -> String {
+        format!("+++\nname = \"{name}\"\n+++\n\n")
+    }
+
+    #[test]
+    fn contract_legacy_import_lists_unimported_and_failed_directories() {
+        let root = tempfile::tempdir().unwrap();
+        create(root.path(), "alpha", "", vec![]).unwrap();
+        let beta = root.path().join("beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(beta.join("PROJECT.md"), project_md("Beta")).unwrap();
+        let gamma = root.path().join("gamma");
+        std::fs::create_dir_all(gamma.join(".state")).unwrap();
+        std::fs::write(gamma.join("PROJECT.md"), project_md("Gamma")).unwrap();
+        std::fs::write(gamma.join(".state").join("project.json"), "not json").unwrap();
+
+        let index = import_and_list(root.path()).unwrap();
+        let slugs: Vec<_> = index.projects.iter().map(|row| row.slug.as_str()).collect();
+        assert_eq!(slugs, ["alpha", "beta"]);
+        assert!(index.projects.iter().all(|row| row.id.starts_with("prj_")));
+        assert_eq!(index.failed_imports.len(), 1);
+        assert!(index.failed_imports[0].1.contains("does not parse"));
+        assert!(
+            Path::new(&index.failed_imports[0].0)
+                .file_name()
+                .is_some_and(|name| name == "gamma")
+        );
+
+        let again = import_and_list(root.path()).unwrap();
+        assert_eq!(again.projects.len(), 2);
+        assert_eq!(again.failed_imports.len(), 1);
+    }
+
+    #[test]
+    fn contract_a_missing_project_folder_stays_listed() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "delta", "", vec![]).unwrap();
+        std::fs::remove_file(project.project_md()).unwrap();
+        let index = import_and_list(root.path()).unwrap();
+        let row = index
+            .projects
+            .iter()
+            .find(|row| row.slug == "delta")
+            .unwrap();
+        assert_eq!(row.availability, "missing");
+    }
+
+    #[test]
+    fn contract_open_name_prefers_an_existing_slug() {
+        let projects = vec![
+            NamedProject {
+                slug: "horca".into(),
+                display_name: "Horca".into(),
+            },
+            NamedProject {
+                slug: "other".into(),
+                display_name: "horca".into(),
+            },
+            NamedProject {
+                slug: "twin-a".into(),
+                display_name: "Same".into(),
+            },
+            NamedProject {
+                slug: "twin-b".into(),
+                display_name: "Same".into(),
+            },
+        ];
+        assert_eq!(resolve_open_name(&projects, "horca").unwrap(), "horca");
+        assert_eq!(resolve_open_name(&projects, "Horca").unwrap(), "horca");
+        assert!(resolve_open_name(&projects, "Same").is_err());
+        assert!(resolve_open_name(&projects, "missing").is_err());
+    }
+
+    fn spec(name: &str, repos: Vec<Repo>) -> NewProject {
+        NewProject {
+            name: name.into(),
+            goal: "Ship".into(),
+            repos,
+            thread_profile: "claude".into(),
+            coordinator_profile: "luna".into(),
+            prefix: "hp --root /tmp".into(),
+        }
+    }
+
+    #[test]
+    fn contract_create_rejects_a_duplicate_and_keeps_one_project() {
+        let root = tempfile::tempdir().unwrap();
+        let before = import_and_list(root.path()).unwrap();
+        assert!(before.projects.is_empty());
+        create_with_setup(root.path(), &spec("Demo", vec![])).unwrap();
+        let error = create_with_setup(root.path(), &spec("Demo", vec![])).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(import_and_list(root.path()).unwrap().projects.len(), 1);
+    }
+
+    #[test]
+    fn contract_create_stores_one_or_many_repositories() {
+        let root = tempfile::tempdir().unwrap();
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        let project = create_with_setup(
+            root.path(),
+            &spec(
+                "Demo",
+                vec![
+                    Repo {
+                        path: one.path().display().to_string(),
+                        machine: None,
+                    },
+                    Repo {
+                        path: two.path().display().to_string(),
+                        machine: None,
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+        let (settings, _) = project.read_project_md().unwrap();
+        assert_eq!(settings.repos.len(), 2);
+        assert_eq!(settings.coordinator_profile, "luna");
+        assert!(project.dir().join("AGENTS.md").is_file());
+        assert!(!setup_incomplete(&project).unwrap());
+    }
+
+    #[test]
+    fn contract_finish_setup_keeps_a_changed_agents_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "Ship", vec![]).unwrap();
+        begin_setup(&project, "claude", "luna").unwrap();
+        let (settings, _) = project.read_project_md().unwrap();
+        let expected = agents_md(
+            &display_name(&settings.name, &project.slug),
+            &project.slug,
+            "hp --root /tmp",
+        );
+        let edited = expected.replace(
+            "Written by herdr-projects",
+            "Written by herdr-projects. user note",
+        );
+        std::fs::write(project.dir().join("AGENTS.md"), &edited).unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        let intervention = error.downcast::<SetupIntervention>().unwrap();
+        assert_eq!(intervention.path, "AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap(),
+            edited
+        );
+        assert!(setup_incomplete(&project).unwrap());
+        assert_eq!(import_and_list(root.path()).unwrap().projects.len(), 1);
+        let kept = std::fs::read_to_string(project.project_md()).unwrap();
+        std::fs::write(project.project_md(), kept.replace("Ship", "keep me")).unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        assert!(error.downcast::<SetupIntervention>().is_ok());
+        assert!(
+            std::fs::read_to_string(project.project_md())
+                .unwrap()
+                .contains("keep me")
+        );
+        assert_eq!(import_and_list(root.path()).unwrap().projects.len(), 1);
+    }
+
+    #[test]
+    fn contract_finish_setup_keeps_a_regular_claude_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "Ship", vec![]).unwrap();
+        begin_setup(&project, "claude", "luna").unwrap();
+        let (settings, _) = project.read_project_md().unwrap();
+        let expected = agents_md(
+            &display_name(&settings.name, &project.slug),
+            &project.slug,
+            "hp --root /tmp",
+        );
+        std::fs::write(project.dir().join("AGENTS.md"), &expected).unwrap();
+        let claude = project.dir().join("CLAUDE.md");
+        std::fs::write(&claude, "user notes").unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        let intervention = error.downcast::<SetupIntervention>().unwrap();
+        assert_eq!(intervention.path, "CLAUDE.md");
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), "user notes");
+        assert_eq!(
+            std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn contract_finish_setup_keeps_an_unmarked_agents_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "Ship", vec![]).unwrap();
+        begin_setup(&project, "claude", "claude").unwrap();
+        let agents = project.dir().join("AGENTS.md");
+        let claude = project.dir().join("CLAUDE.md");
+        std::fs::write(&agents, "user agents notes\n").unwrap();
+        std::fs::write(&claude, "user claude notes\n").unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        let intervention = error.downcast::<SetupIntervention>().unwrap();
+        assert_eq!(intervention.path, "AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "user agents notes\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&claude).unwrap(),
+            "user claude notes\n"
+        );
+        assert!(
+            !project
+                .dir()
+                .join("AGENTS.md.before-herdr-projects")
+                .exists()
+        );
+        assert!(
+            !project
+                .dir()
+                .join("CLAUDE.md.before-herdr-projects")
+                .exists()
+        );
+        assert!(setup_incomplete(&project).unwrap());
+    }
+
+    #[test]
+    fn contract_finish_setup_keeps_a_user_claude_file_when_agents_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "Ship", vec![]).unwrap();
+        begin_setup(&project, "claude", "claude").unwrap();
+        let agents = project.dir().join("AGENTS.md");
+        let claude = project.dir().join("CLAUDE.md");
+        let text = "user claude notes\n";
+        std::fs::write(&claude, text).unwrap();
+        let error = finish_setup(&project, "hp --root /tmp").unwrap_err();
+        let intervention = error.downcast::<SetupIntervention>().unwrap();
+        assert_eq!(intervention.path, "CLAUDE.md");
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), text);
+        assert!(!agents.exists());
+        assert!(
+            !project
+                .dir()
+                .join("CLAUDE.md.before-herdr-projects")
+                .exists()
+        );
+        assert!(setup_incomplete(&project).unwrap());
+    }
+
+    #[test]
+    fn priming_decision_covers_every_ownership_pair() {
+        use PrimingChoice::{Create, Intervene, Recognize};
+        use PrimingFile::{Expected, Missing, Unreadable, UserOwned};
+        let cases = [
+            (Missing, Missing, Create),
+            (Missing, Expected, Create),
+            (Missing, UserOwned, Intervene { path: "CLAUDE.md" }),
+            (Missing, Unreadable, Intervene { path: "CLAUDE.md" }),
+            (Expected, Missing, Recognize),
+            (Expected, Expected, Recognize),
+            (Expected, UserOwned, Intervene { path: "CLAUDE.md" }),
+            (Expected, Unreadable, Intervene { path: "CLAUDE.md" }),
+            (UserOwned, Missing, Intervene { path: "AGENTS.md" }),
+            (UserOwned, Expected, Intervene { path: "AGENTS.md" }),
+            (UserOwned, UserOwned, Intervene { path: "AGENTS.md" }),
+            (UserOwned, Unreadable, Intervene { path: "AGENTS.md" }),
+            (Unreadable, Missing, Intervene { path: "AGENTS.md" }),
+            (Unreadable, Expected, Intervene { path: "AGENTS.md" }),
+            (Unreadable, UserOwned, Intervene { path: "AGENTS.md" }),
+            (Unreadable, Unreadable, Intervene { path: "AGENTS.md" }),
+        ];
+        assert_eq!(cases.len(), 16);
+        for (agents, claude, choice) in cases {
+            assert_eq!(
+                priming_decision(agents, claude),
+                choice,
+                "{agents:?} {claude:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contract_a_finished_setup_step_is_not_rewritten() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create_with_setup(root.path(), &spec("Demo", vec![])).unwrap();
+        let path = project.dir().join("AGENTS.md");
+        let edited = format!("{}\nuser note\n", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, &edited).unwrap();
+        finish_setup(&project, "hp --root /tmp").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(!setup_incomplete(&project).unwrap());
     }
 }

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: ubuntu / 1.89
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup component add rustfmt clippy --toolchain 1.89.0
+          rustup default 1.89.0
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets
+
+  test:
+    name: ${{ matrix.os }} / stable
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Test
+        run: cargo test --locked --all-targets
