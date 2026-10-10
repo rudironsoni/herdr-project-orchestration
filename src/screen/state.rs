@@ -1138,7 +1138,7 @@ pub fn coordinator_state(line: &str) -> CoordinatorState {
     } else if body.starts_with("socket present") {
         CoordinatorState::Recorded
     } else {
-        CoordinatorState::Unknown
+        CoordinatorState::Ineligible
     }
 }
 
@@ -1155,28 +1155,14 @@ pub fn coordinator_actions(card: Option<&Card>) -> Vec<(String, Command)> {
                 Command::InspectCoordinator,
             ));
         }
-        CoordinatorState::Working => {
-            actions.push((
-                "Inspect working coordinator".into(),
-                Command::InspectCoordinator,
-            ));
-        }
-        CoordinatorState::Blocked => {
-            actions.push((
-                "Inspect blocked coordinator".into(),
-                Command::InspectCoordinator,
-            ));
-        }
-        CoordinatorState::Starting => {
-            actions.push((
-                "Inspect starting coordinator".into(),
-                Command::InspectCoordinator,
-            ));
-        }
-        CoordinatorState::Unknown | CoordinatorState::Ineligible => {
+        CoordinatorState::Ineligible => {
             actions.push(("Inspect coordinator".into(), Command::InspectCoordinator));
         }
-        CoordinatorState::Recorded => {
+        CoordinatorState::Working
+        | CoordinatorState::Blocked
+        | CoordinatorState::Starting
+        | CoordinatorState::Unknown
+        | CoordinatorState::Recorded => {
             actions.push((
                 "Open coordinator in Herdr".into(),
                 Command::OpenConversation,

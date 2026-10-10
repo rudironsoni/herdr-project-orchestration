@@ -552,10 +552,10 @@ fn coordinator_blurb(line: &str) -> String {
         CoordinatorState::Stale => {
             "Stale coordinator. The recorded pane is not a live primary.".into()
         }
-        CoordinatorState::Working => "Coordinator is working. Focus stays closed.".into(),
-        CoordinatorState::Blocked => "Coordinator is blocked. Focus stays closed.".into(),
-        CoordinatorState::Starting => "Coordinator is starting. Focus stays closed.".into(),
-        CoordinatorState::Unknown => "Coordinator status is unknown. Focus stays closed.".into(),
+        CoordinatorState::Working => "Coordinator is working.".into(),
+        CoordinatorState::Blocked => "Coordinator is blocked.".into(),
+        CoordinatorState::Starting => "Coordinator is starting.".into(),
+        CoordinatorState::Unknown => "Coordinator status is unknown.".into(),
         CoordinatorState::Ineligible => "Coordinator record is not eligible to focus.".into(),
         CoordinatorState::Recorded => {
             "Socket recorded. A socket is not proof the agent is running.".into()
@@ -1278,7 +1278,7 @@ pub fn open_worker_thread<'a>(
         return card.threads.iter().find(|thread| thread.id == thread_id);
     }
     if nav.tab == 0 {
-        return thread_by_selection(card, clamp(nav.threads.selected, card.threads.len()));
+        return thread_by_selection(card, nav.threads.selected);
     }
     None
 }

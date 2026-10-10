@@ -427,7 +427,8 @@ pub(crate) fn build(
                 request.machine = thread.machine.clone();
                 request.pr = thread.pr.clone();
                 request.title = thread.title.clone();
-            } else if nav.overview {
+            } else {
+                request.target_id.clear();
                 request.pane.clear();
                 request.machine.clear();
             }

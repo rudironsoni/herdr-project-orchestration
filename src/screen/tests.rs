@@ -1364,7 +1364,7 @@ fn contract_open_coordinator_requires_the_live_primary() {
         )
         .unwrap();
     };
-    let expect = |status: &str, state: state::CoordinatorState, label: &str| {
+    let expect = |status: &str, state: state::CoordinatorState, word: &str| {
         set(status);
         let snap = reload(&fixture);
         let card = horizon(&snap);
@@ -1374,30 +1374,20 @@ fn contract_open_coordinator_requires_the_live_primary() {
             "{}",
             card.coordinator
         );
-        assert!(!offers_open(card), "{}", card.coordinator);
+        assert!(card.coordinator.contains(word), "{}", card.coordinator);
+        assert!(offers_open(card), "{}", card.coordinator);
         let text = frame(&app_on(&snap), &snap, 120, 30);
-        assert!(text.contains(label), "{text}");
-        assert!(!text.contains("Open coordinator in Herdr"), "{text}");
+        assert!(text.contains("Open coordinator in Herdr"), "{text}");
+        assert!(text.contains(word), "{text}");
+        assert!(!text.contains("Focus stays closed"), "{text}");
     };
-    expect(
-        "working",
-        state::CoordinatorState::Working,
-        "Inspect working coordinator",
-    );
-    expect(
-        "blocked",
-        state::CoordinatorState::Blocked,
-        "Inspect blocked coordinator",
-    );
-    expect(
-        "starting",
-        state::CoordinatorState::Starting,
-        "Inspect starting coordinator",
-    );
+    expect("working", state::CoordinatorState::Working, "working");
+    expect("blocked", state::CoordinatorState::Blocked, "blocked");
+    expect("starting", state::CoordinatorState::Starting, "starting");
     expect(
         "not-a-ready-state",
         state::CoordinatorState::Unknown,
-        "Inspect coordinator",
+        "unknown",
     );
 
     set("idle");
@@ -1490,6 +1480,27 @@ fn contract_o_opens_the_selected_attention_thread() {
     let built = crate::screen::jobs::build(&app, snap, &Command::OpenWorker, Some("hp")).unwrap();
     assert_eq!(built.target_id, tab.id);
     assert_ne!(built.target_id, failed.id);
+
+    let start = card.threads.len();
+    for _ in 0..start + 2 {
+        if app
+            .nav
+            .get(&id)
+            .is_some_and(|nav| nav.threads.selected == start)
+        {
+            break;
+        }
+        state::apply(&mut app, Command::Move(1), snap, 160);
+    }
+    assert_eq!(app.nav.get(&id).unwrap().threads.selected, start);
+    assert!(compose::open_worker_thread(&app, snap).is_none());
+    assert_ne!(
+        press(&mut app, snap, KeyCode::Char('o')),
+        Command::OpenWorker
+    );
+    let built = crate::screen::jobs::build(&app, snap, &Command::OpenWorker, Some("hp")).unwrap();
+    assert!(built.pane.is_empty(), "{}", built.pane);
+    assert!(built.target_id.is_empty(), "{}", built.target_id);
 }
 
 #[test]
