@@ -1,4 +1,4 @@
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::project::{self, NewProject, Repo};
 use crate::screen::compose::{self, Placed};
@@ -250,42 +250,64 @@ fn contract_frames_at_the_layout_breakpoints() {
     assert!(threads.iter().any(|thread| thread.status == Status::Failed));
 
     let mut app = app_on(snap);
-    assert_eq!(state::columns(79), Columns::TooSmall);
-    assert_eq!(state::columns(80), Columns::One);
-    let tiny_lines: Vec<_> = compose::plan(&app, snap, 79, 24)
-        .into_iter()
-        .map(|line| line.text)
-        .collect();
-    assert_eq!(
-        tiny_lines,
-        vec![
-            "HERDR PROJECTS".to_string(),
-            "Terminal is too small".to_string(),
-            "79x24".to_string(),
-        ]
-    );
-    let tiny = frame(&app, snap, 79, 24);
-    assert!(tiny.contains("Terminal is too small"));
-    assert!(tiny.contains("79x24"));
-    assert!(!tiny.contains("Current work"));
-    assert!(!tiny.contains("New Project"));
-    assert!(!tiny.contains("Threads"));
-    assert!(!tiny.contains("Start coordinator"));
-    assert!(!tiny.contains("Draft:"));
-    save_frame("79x24.txt", &tiny);
-    let narrow = frame(&app, snap, 80, 24);
-    assert!(narrow.contains("Current work"));
-    assert!(!narrow.contains("Terminal is too small"));
-    save_frame("80x24.txt", &narrow);
-    for (width, height) in [(100, 24), (120, 30)] {
+    assert_eq!(state::columns(23), Columns::TooSmall);
+    assert_eq!(state::columns(24), Columns::Stacked);
+    assert_eq!(state::columns(80), Columns::Stacked);
+    assert_eq!(state::columns(100), Columns::Three);
+    assert_eq!(state::columns(160), Columns::Three);
+    let sizes = [
+        (50, 30),
+        (60, 35),
+        (70, 30),
+        (80, 24),
+        (100, 24),
+        (120, 30),
+        (160, 40),
+    ];
+    for (width, height) in sizes {
         let text = frame(&app, snap, width, height);
-        assert!(text.contains("Current work and recent reports"), "{width}");
-        assert!(text.contains("Threads"), "{width}");
+        assert!(text.contains("HERDR PROJECTS"), "{width}x{height}\n{text}");
+        assert!(text.contains("horizon"), "{width}x{height}");
+        assert!(text.contains("other"), "{width}x{height}");
+        assert!(text.contains("SELECTED"), "{width}x{height}");
+        assert!(text.contains("New Project"), "{width}x{height}");
+        assert!(
+            text.contains("Inspect stale coordinator"),
+            "{width}x{height}\n{text}"
+        );
+        assert!(
+            text.contains("OVERVIEW") || text.contains("[OVERVIEW]"),
+            "{width}x{height}"
+        );
+        assert!(!text.contains("Terminal is too small"), "{width}x{height}");
+        assert!(!text.contains("Draft:"), "{width}x{height}");
+        assert!(!text.contains("ASK COORDINATOR"), "{width}x{height}");
+        for line in text.lines() {
+            assert_eq!(line.chars().count(), width as usize, "{width}x{height}");
+        }
         save_frame(&format!("{width}x{height}.txt"), &text);
     }
+    let mut long = snap.clone();
+    let horizon_card = long
+        .projects
+        .iter_mut()
+        .find(|card| card.slug == "horizon")
+        .unwrap();
+    horizon_card.goal =
+        "Finish the SQLAlchemy 2.0 adoption in partners. The full goal stays readable on a phone."
+            .into();
+    horizon_card.name = format!("LongName{}", "Z".repeat(80));
+    let narrow_name = frame(&app, &long, 50, 30);
+    assert!(narrow_name.contains("LongName"));
+    assert!(narrow_name.contains("Finish the SQLAlchemy"));
+    assert!(!narrow_name.contains("phone."));
+    assert!(!narrow_name.contains(&"Z".repeat(40)));
+    for line in narrow_name.lines() {
+        assert_eq!(line.chars().count(), 50);
+    }
     let mid = frame(&app, snap, 120, 30);
-    assert!(!mid.contains("New Project"));
-    save_frame("120x30.txt", &mid);
+    assert!(mid.contains("New Project"));
+    assert!(mid.contains("horizon"));
     state::apply(&mut app, Command::SelectTab(3), snap, 160);
     let id = app.project_id(snap).unwrap();
     app.prompt_mut(&id).outgoing.push((
@@ -297,7 +319,7 @@ fn contract_frames_at_the_layout_breakpoints() {
     assert!(wide.contains("New Project"));
     assert!(wide.contains("Threads"));
     assert!(wide.contains("LongTitleProbe"));
-    assert!(wide.contains("Goal:"));
+    assert!(wide.contains("GOAL"));
     assert!(wide.contains("report t-0001:"));
     assert!(wide.contains("recorded reference"));
     assert!(wide.contains("import failed"));
@@ -311,7 +333,137 @@ fn contract_frames_at_the_layout_breakpoints() {
     assert!(!wide.contains("replied"));
     assert!(!wide.contains("Accepted"));
     assert!(!wide.contains("w9:p9"));
-    save_frame("160x40.txt", &wide);
+}
+
+#[test]
+fn contract_cockpit_selects_a_project_without_leaving_the_portfolio() {
+    let fixture = fixture();
+    let snap = &fixture.snap;
+    let mut preset = App::default();
+    preset.select_slug(snap, "other");
+    let preset_text = frame(&preset, snap, 80, 24);
+    assert!(preset_text.contains("SELECTED / Other"), "{preset_text}");
+    assert!(preset_text.contains("horizon"), "{preset_text}");
+    assert!(preset_text.contains("Start coordinator"), "{preset_text}");
+    assert!(preset.pending_focus.is_none());
+
+    let mut app = app_on(snap);
+    assert!(app.pending_focus.is_none());
+    let before = frame(&app, snap, 120, 30);
+    assert!(before.contains("SELECTED / Horizon"), "{before}");
+    assert!(app.pending_focus.is_none());
+    assert!(app.stack.is_empty());
+
+    let other = snap
+        .projects
+        .iter()
+        .position(|card| card.slug == "other")
+        .unwrap();
+    state::apply(&mut app, Command::SelectProject(other), snap, 120);
+    let selected = frame(&app, snap, 60, 35);
+    assert!(selected.contains("SELECTED / Other"), "{selected}");
+    assert!(selected.contains("Start coordinator"), "{selected}");
+    assert!(selected.contains("No coordinator recorded"), "{selected}");
+    assert!(selected.contains("Start first Thread"), "{selected}");
+    assert!(selected.contains("horizon"), "{selected}");
+    assert_eq!(app.project_id(snap).unwrap(), snap.projects[other].id);
+    state::apply(&mut app, Command::SelectTab(1), snap, 60);
+    assert_eq!(app.project_id(snap).unwrap(), snap.projects[other].id);
+    assert_eq!(app.nav[&snap.projects[other].id].tab, 1);
+    assert!(!app.nav[&snap.projects[other].id].overview);
+
+    let mut recorded = snap.clone();
+    recorded.projects[0].coordinator =
+        "coordinator: socket present pane w1:p1 hpc-horizon profile claude".into();
+    state::apply(&mut app, Command::SelectProject(0), &recorded, 120);
+    let open = line_matching(&app, &recorded, 120, 30, |line| {
+        line.text.starts_with("Open coordinator in Herdr")
+    });
+    assert_eq!(open.command, Command::OpenConversation);
+    let mut blocked = snap.clone();
+    blocked.projects[0].coordinator =
+        "coordinator: no socket pane none unnamed profile claude".into();
+    let inspect = line_matching(&app, &blocked, 120, 30, |line| {
+        line.text.starts_with("Inspect coordinator") && !line.text.contains("stale")
+    });
+    assert_eq!(inspect.command, Command::InspectCoordinator);
+
+    assert!(
+        !snap.needs.is_empty(),
+        "the fixture records thread attention"
+    );
+    let row = &snap.needs[0];
+    let project = snap
+        .projects
+        .iter()
+        .position(|card| card.id == row.project_id)
+        .unwrap();
+    state::apply(
+        &mut app,
+        Command::OpenAttention {
+            project,
+            thread_id: row.thread_id.clone(),
+        },
+        snap,
+        120,
+    );
+    assert_eq!(app.project_ix, project);
+    assert_eq!(app.side, Side::All);
+    let card = &snap.projects[project];
+    let nav = &app.nav[&card.id];
+    assert!(!nav.overview);
+    assert_eq!(nav.tab, 0);
+    assert_eq!(
+        nav.threads.selected,
+        compose::display_index(card, &row.thread_id).unwrap()
+    );
+    assert!(matches!(app.stack.last(), Some(state::Layer::Detail)));
+
+    app.stack.clear();
+    app.focus = Focus::Projects;
+    app.side = Side::All;
+    let len = state::side_len(snap, app.side, None);
+    app.side_list.selected = len - 1;
+    let scrolled = frame(&app, snap, 50, 30);
+    assert!(scrolled.contains("Project menu"), "{scrolled}");
+    assert!(scrolled.contains("SELECTED"), "{scrolled}");
+    assert!(!scrolled.contains("New Project"), "{scrolled}");
+
+    let mut counted = snap.clone();
+    counted.inbox.push(load::InboxRow {
+        project_id: card.id.clone(),
+        slug: card.slug.clone(),
+        id: "in-cockpit".into(),
+        summary: "cockpit inbox".into(),
+        body: "body".into(),
+    });
+    let counts = frame(&app, &counted, 160, 40);
+    assert!(counts.contains(&format!("{} Need you", counted.needs.len())));
+    assert!(counts.contains(&format!("{} Inbox", counted.inbox.len())));
+    assert_ne!(counted.needs.len(), counted.inbox.len());
+
+    app.stack.clear();
+    app.focus = Focus::Overview;
+    for digit in 1..=6 {
+        assert_eq!(
+            input::key_command(&mut app, snap, input::key(KeyCode::Char('g')), 120, 30),
+            Command::Nothing
+        );
+        let ch = char::from(b'0' + digit);
+        assert_eq!(
+            input::key_command(&mut app, snap, input::key(KeyCode::Char(ch)), 120, 30),
+            Command::SelectTab((digit - 1) as usize)
+        );
+    }
+    app.focus = Focus::Prompt;
+    assert_eq!(
+        input::key_command(&mut app, snap, input::key(KeyCode::Char('o')), 120, 30),
+        Command::Insert('o')
+    );
+    let too_narrow = frame(&app, snap, 23, 30);
+    let too_short = frame(&app, snap, 50, 9);
+    assert!(too_narrow.contains("Terminal is too small"));
+    assert!(too_short.contains("Terminal is too small"));
 }
 
 #[test]
@@ -320,20 +472,23 @@ fn contract_work_actions_stay_reachable_on_a_short_pane() {
     let snap = &fixture.snap;
     let mut app = app_on(snap);
     app.focus = Focus::Work;
-    for (width, height) in [(80, 24), (100, 24)] {
+    for (width, height) in [(40, 16), (50, 30), (80, 24), (100, 24)] {
         let text = frame(&app, snap, width, height);
-        assert!(text.contains("Goal:"), "{width}");
-        assert!(text.contains("Start coordinator"), "{width}");
-        assert!(text.contains("Draft:"), "{width}");
-        let start = line_matching(&app, snap, width, height, |line| {
-            line.text.starts_with("Start coordinator")
+        assert!(
+            text.contains("Inspect stale coordinator"),
+            "{width}x{height}\n{text}"
+        );
+        assert!(!text.contains("Draft:"), "{width}");
+        assert!(!text.contains("Open coordinator in Herdr"), "{width}");
+        let stale = line_matching(&app, snap, width, height, |line| {
+            line.text.starts_with("Inspect stale coordinator")
         });
-        assert_eq!(start.command, Command::StartCoordinator);
+        assert_eq!(stale.command, Command::InspectCoordinator);
     }
     state::apply(&mut app, Command::Move(1), snap, 80);
     assert_eq!(
         input::key_command(&mut app, snap, input::key(KeyCode::Enter), 80, 24),
-        Command::StartCoordinator
+        Command::FocusPrompt
     );
     let mut incomplete = snap.clone();
     incomplete
@@ -348,6 +503,19 @@ fn contract_work_actions_stay_reachable_on_a_short_pane() {
         line.text.starts_with("Finish setup")
     });
     assert_eq!(finish.command, Command::FinishSetup);
+}
+
+#[test]
+fn ctrl_c_quits_while_the_prompt_is_open() {
+    let fixture = fixture();
+    let snap = &fixture.snap;
+    let mut app = app_on(snap);
+    app.focus = Focus::Prompt;
+    let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(
+        input::key_command(&mut app, snap, key, 63, 41),
+        Command::Quit
+    );
 }
 
 #[test]
@@ -427,18 +595,23 @@ fn contract_keys_and_clicks_use_the_same_command() {
 
     app.focus = Focus::Work;
     let open = line_matching(&app, snap, 160, 40, |line| {
-        line.text.starts_with("Open conversation")
+        line.text.starts_with("Inspect stale coordinator")
     });
+    assert_eq!(open.command, Command::InspectCoordinator);
     assert_eq!(
         input::key_command(&mut app, snap, input::key(KeyCode::Enter), 160, 40),
         open.command
     );
     assert_eq!(
         input::click_command(&app, snap, open.x, open.y, 160, 40),
-        Command::OpenConversation
+        Command::InspectCoordinator
+    );
+    assert_eq!(
+        input::key_command(&mut app, snap, input::key(KeyCode::Char('o')), 160, 40),
+        Command::InspectCoordinator
     );
 
-    app.focus = Focus::Overview;
+    state::apply(&mut app, Command::SelectTab(0), snap, 160);
     let thread = line_matching(&app, snap, 160, 40, |line| {
         line.command == Command::Inspect && line.text.starts_with("t-0001")
     });
@@ -646,12 +819,11 @@ fn contract_overview_keys_menu_and_separate_counts() {
         Command::OpenProjectSelection
     );
     state::apply(&mut app, Command::OpenProjectSelection, snap, 120);
+    assert!(app.stack.is_empty());
+    assert_eq!(app.focus, Focus::Projects);
     let picker = frame(&app, snap, 120, 30);
     assert!(picker.contains("New Project"));
-    assert_eq!(press(&mut app, snap, KeyCode::Esc), Command::Cancel);
-    state::apply(&mut app, Command::Cancel, snap, 120);
-    let closed = frame(&app, snap, 120, 30);
-    assert!(!closed.contains("New Project"));
+    assert!(picker.contains("horizon"));
 
     state::apply(&mut app, Command::OpenProjectSelection, snap, 160);
     assert!(app.stack.is_empty());
@@ -912,7 +1084,8 @@ fn contract_filter_sweep_rename_unarchive_and_copy() {
         Command::Nothing
     );
     assert_eq!(app.filter.as_deref(), Some(""));
-    assert!(matches!(app.stack.last(), Some(state::Layer::Picker)));
+    assert!(app.stack.is_empty());
+    assert_eq!(app.focus, Focus::Projects);
     for ch in ['o', 't', 'h'] {
         on_width(&mut app, snap, KeyCode::Char(ch), 120);
     }
@@ -934,17 +1107,12 @@ fn contract_filter_sweep_rename_unarchive_and_copy() {
         Command::Nothing
     );
     assert!(app.filter.is_none());
-    assert!(matches!(app.stack.last(), Some(state::Layer::Picker)));
+    assert!(app.stack.is_empty());
     assert!(
         compose::side_rows(&app, snap)
             .iter()
             .any(|(text, _)| text.starts_with("horizon "))
     );
-    assert_eq!(
-        on_width(&mut app, snap, KeyCode::Esc, 120),
-        Command::Nothing
-    );
-    assert!(app.stack.is_empty());
 
     app.stack.clear();
     app.filter = None;
@@ -958,8 +1126,10 @@ fn contract_filter_sweep_rename_unarchive_and_copy() {
 
     app.focus = Focus::Work;
     on_key(&mut app, snap, KeyCode::Tab);
+    assert_eq!(app.focus, Focus::Tabs);
     on_key(&mut app, snap, KeyCode::Tab);
-    assert_eq!(app.focus, Focus::Prompt);
+    assert_eq!(app.focus, Focus::Overview);
+    app.focus = Focus::Prompt;
     assert_eq!(on_key(&mut app, snap, KeyCode::Char('/')), Command::Nothing);
     assert_eq!(app.filter, None);
     assert_eq!(app.prompt_mut(&app.project_id(snap).unwrap()).draft, "/");
@@ -997,6 +1167,9 @@ fn contract_filter_sweep_rename_unarchive_and_copy() {
     app.focus = Focus::Overview;
     on_key(&mut app, &again, KeyCode::Char('g'));
     on_key(&mut app, &again, KeyCode::Char('1'));
+    let card = horizon(&again);
+    let index = compose::display_index(card, "t-0001").expect("t-0001");
+    app.nav.get_mut(&card.id).unwrap().threads.selected = index;
     assert_eq!(on_key(&mut app, &again, KeyCode::Enter), Command::Nothing);
     for _ in 0..4 {
         on_key(&mut app, &again, KeyCode::Down);

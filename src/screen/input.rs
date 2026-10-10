@@ -1,6 +1,4 @@
-#[cfg(test)]
-use ratatui::crossterm::event::KeyModifiers;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::screen::compose;
 use crate::screen::load::Snapshot;
@@ -20,6 +18,10 @@ pub fn key_command(
 ) -> Command {
     if key.kind != KeyEventKind::Press {
         return Command::Nothing;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        return Command::Quit;
     }
     if let Some(command) = layer_key(app, snap, &key, width, height) {
         return command;
@@ -42,7 +44,7 @@ pub fn key_command(
     match key.code {
         KeyCode::Char('P') => Command::OpenProjectSelection,
         KeyCode::Enter => compose::activation(app, snap, width, height),
-        KeyCode::Char('o') => Command::OpenWorker,
+        KeyCode::Char('o') => open_target(app, snap),
         KeyCode::Esc => Command::Cancel,
         KeyCode::Tab => Command::FocusNext,
         KeyCode::BackTab => Command::FocusPrev,
@@ -182,24 +184,43 @@ fn filter_key(app: &App, snap: &Snapshot, key: &KeyEvent, width: u16, height: u1
     }
 }
 
+fn open_target(app: &App, snap: &Snapshot) -> Command {
+    if app.focus != Focus::Work {
+        return Command::OpenWorker;
+    }
+    let card = app.card(snap);
+    let actions = state::coordinator_actions(card);
+    let selected = card
+        .and_then(|card| app.nav.get(&card.id))
+        .map(|nav| compose::clamp(nav.work.selected, actions.len()))
+        .unwrap_or(0);
+    actions
+        .get(selected)
+        .map(|(_, command)| command.clone())
+        .unwrap_or(Command::OpenWorker)
+}
+
 fn copy_command(app: &App, snap: &Snapshot) -> Command {
     let Some(card) = app.card(snap) else {
         return Command::Nothing;
     };
-    let nav = app.nav.get(&card.id);
-    let tab = nav.map(|nav| nav.tab).unwrap_or(0);
-    if tab == 0 {
-        let thread = nav
-            .and_then(|nav| card.threads.get(nav.threads.selected))
+    let Some(nav) = app.nav.get(&card.id) else {
+        return Command::Nothing;
+    };
+    if nav.overview {
+        return Command::Nothing;
+    }
+    if nav.tab == 0 {
+        let thread = compose::thread_by_selection(card, nav.threads.selected)
             .filter(|thread| !thread.files.is_empty());
         if let Some(thread) = thread {
-            let selected = nav.map(|nav| nav.detail.selected).unwrap_or(0);
+            let selected = nav.detail.selected;
             let index = selected.saturating_sub(4).min(thread.files.len() - 1);
             return Command::CopyPath(thread.files[index].clone());
         }
     }
-    if tab == 2
-        && let Some(file) = nav.and_then(|nav| card.library.get(nav.library.selected))
+    if nav.tab == 2
+        && let Some(file) = card.library.get(nav.library.selected)
     {
         return Command::CopyPath(file.path.clone());
     }
@@ -275,8 +296,11 @@ fn routines_tab(app: &App, snap: &Snapshot) -> bool {
 }
 
 fn tab_is(app: &App, snap: &Snapshot, tab: usize) -> bool {
-    app.project_id(snap)
-        .is_some_and(|id| app.nav.get(&id).map(|nav| nav.tab).unwrap_or(0) == tab)
+    app.project_id(snap).is_some_and(|id| {
+        app.nav
+            .get(&id)
+            .is_some_and(|nav| !nav.overview && nav.tab == tab)
+    })
 }
 
 #[cfg(test)]

@@ -72,7 +72,7 @@ pub fn side_len(snap: &Snapshot, side: Side, filter: Option<&str>) -> usize {
                 .filter(|card| project_visible(&card.name, &card.slug, filter))
                 .count()
                 + snap.failed.len()
-                + 1
+                + 4
         }
         Side::Needs => head + snap.needs.len().max(1),
         Side::Inbox => head + snap.inbox.len().max(1),
@@ -80,10 +80,12 @@ pub fn side_len(snap: &Snapshot, side: Side, filter: Option<&str>) -> usize {
 }
 
 pub fn detail_count(card: Option<&Card>, nav: &Nav) -> usize {
-    let files = if nav.tab == 0 {
-        card.and_then(|card| card.threads.get(nav.threads.selected))
-            .map(|thread| thread.files.len())
-            .unwrap_or(0)
+    let files = if !nav.overview && nav.tab == 0 {
+        card.and_then(|card| {
+            crate::screen::compose::thread_by_selection(card, nav.threads.selected)
+        })
+        .map(|thread| thread.files.len())
+        .unwrap_or(0)
     } else {
         0
     };
@@ -96,8 +98,10 @@ pub fn detail_len() -> usize {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
+    Global,
     Projects,
     Work,
+    Tabs,
     Overview,
     Prompt,
 }
@@ -112,21 +116,22 @@ pub enum Side {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Columns {
     Three,
-    Two,
-    One,
+    Stacked,
     TooSmall,
 }
 
 pub fn columns(width: u16) -> Columns {
-    if width >= 160 {
+    if width >= 100 {
         Columns::Three
-    } else if width >= 100 {
-        Columns::Two
-    } else if width >= 80 {
-        Columns::One
+    } else if width >= 24 {
+        Columns::Stacked
     } else {
         Columns::TooSmall
     }
+}
+
+pub fn cockpit_fits(width: u16, height: u16) -> bool {
+    width >= 24 && height >= 10
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -160,9 +165,10 @@ impl ListPos {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Nav {
     pub tab: usize,
+    pub overview: bool,
     pub threads: ListPos,
     pub tasks: ListPos,
     pub library: ListPos,
@@ -171,6 +177,25 @@ pub struct Nav {
     pub resources: ListPos,
     pub work: ListPos,
     pub detail: ListPos,
+    pub overview_pos: ListPos,
+}
+
+impl Default for Nav {
+    fn default() -> Self {
+        Self {
+            tab: 0,
+            overview: true,
+            threads: ListPos::default(),
+            tasks: ListPos::default(),
+            library: ListPos::default(),
+            prs: ListPos::default(),
+            routines: ListPos::default(),
+            resources: ListPos::default(),
+            work: ListPos::default(),
+            detail: ListPos::default(),
+            overview_pos: ListPos::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -284,6 +309,7 @@ pub enum Command {
     FocusNext,
     FocusPrev,
     OpenProjectSelection,
+    ShowOverview,
     SelectTab(usize),
     SelectSide(Side),
     SelectProject(usize),
@@ -345,6 +371,8 @@ pub enum Command {
     RenameStart,
     Rename,
     CopyPath(String),
+    InspectCoordinator,
+    OpenAttention { project: usize, thread_id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -447,17 +475,27 @@ pub fn apply(app: &mut App, command: Command, snap: &Snapshot, width: u16) -> Co
         }
         Command::OpenProjectSelection => {
             app.g = false;
-            if cols == Columns::Three {
+            if cockpit_fits(width, 10) && cols != Columns::TooSmall {
                 app.focus = Focus::Projects;
             } else {
                 app.stack.push(Layer::Picker);
             }
             Command::Nothing
         }
+        Command::ShowOverview => {
+            if let Some(id) = app.project_id(snap) {
+                app.nav_mut(&id).overview = true;
+            }
+            app.focus = Focus::Overview;
+            app.one = Focus::Overview;
+            Command::Nothing
+        }
         Command::SelectTab(index) => {
             app.g = false;
             if let Some(id) = app.project_id(snap) {
-                app.nav_mut(&id).tab = index.min(5);
+                let nav = app.nav_mut(&id);
+                nav.overview = false;
+                nav.tab = index.min(5);
             }
             app.focus = Focus::Overview;
             app.one = Focus::Overview;
@@ -503,7 +541,7 @@ pub fn apply(app: &mut App, command: Command, snap: &Snapshot, width: u16) -> Co
             app.picker_list = ListPos::default();
             app.side_list = ListPos::default();
             app.side = Side::All;
-            if cols == Columns::Three {
+            if cols != Columns::TooSmall {
                 app.focus = Focus::Projects;
                 if !matches!(
                     app.stack.last(),
@@ -577,6 +615,20 @@ pub fn apply(app: &mut App, command: Command, snap: &Snapshot, width: u16) -> Co
                 app.nav_mut(&id).detail = ListPos::default();
             }
             app.stack.push(Layer::Detail);
+            Command::Nothing
+        }
+        Command::InspectCoordinator => {
+            if let Some(id) = app.project_id(snap) {
+                let line = app
+                    .card(snap)
+                    .map(|card| card.coordinator.clone())
+                    .unwrap_or_else(|| "coordinator missing".into());
+                app.notices.insert(id, format!("not focused; {line}"));
+            }
+            Command::Nothing
+        }
+        Command::OpenAttention { project, thread_id } => {
+            open_attention(app, snap, project, &thread_id);
             Command::Nothing
         }
         Command::SubmitThread => submit_thread(app),
@@ -889,12 +941,17 @@ fn form_insert(field: &mut String, ch: char) {
     field.push(ch);
 }
 
-fn next_focus(focus: Focus, cols: Columns, forward: bool) -> Focus {
-    let order: &[Focus] = match cols {
-        Columns::Three => &[Focus::Projects, Focus::Work, Focus::Overview, Focus::Prompt],
-        Columns::Two => &[Focus::Work, Focus::Overview, Focus::Prompt],
-        Columns::One | Columns::TooSmall => &[Focus::Work, Focus::Overview, Focus::Prompt],
-    };
+fn next_focus(focus: Focus, _cols: Columns, forward: bool) -> Focus {
+    let mut order = vec![
+        Focus::Global,
+        Focus::Projects,
+        Focus::Work,
+        Focus::Tabs,
+        Focus::Overview,
+    ];
+    if focus == Focus::Prompt {
+        order.push(Focus::Prompt);
+    }
     let index = order.iter().position(|item| *item == focus).unwrap_or(0);
     let len = order.len() as i32;
     let next = if forward {
@@ -903,6 +960,28 @@ fn next_focus(focus: Focus, cols: Columns, forward: bool) -> Focus {
         (index as i32 - 1 + len) % len
     };
     order[next as usize]
+}
+
+fn open_attention(app: &mut App, snap: &Snapshot, project: usize, thread_id: &str) {
+    if project < snap.projects.len() {
+        app.project_ix = project;
+        app.side = Side::All;
+    }
+    let Some(card) = app.card(snap) else {
+        return;
+    };
+    let id = card.id.clone();
+    if let Some(index) = crate::screen::compose::display_index(card, thread_id) {
+        let len = card.threads.len();
+        let nav = app.nav_mut(&id);
+        nav.overview = false;
+        nav.tab = 0;
+        nav.threads.set(index, len, 8);
+        nav.detail = ListPos::default();
+    }
+    app.focus = Focus::Overview;
+    app.one = Focus::Overview;
+    app.stack.push(Layer::Detail);
 }
 
 fn move_list(app: &mut App, snap: &Snapshot, delta: i32) {
@@ -960,7 +1039,7 @@ fn move_list(app: &mut App, snap: &Snapshot, delta: i32) {
         return;
     }
     match app.focus {
-        Focus::Projects => {
+        Focus::Global | Focus::Projects => {
             app.side_list.move_by(
                 delta,
                 side_len(snap, app.side, app.filter.as_deref()),
@@ -973,10 +1052,22 @@ fn move_list(app: &mut App, snap: &Snapshot, delta: i32) {
                 app.nav_mut(&id).work.move_by(delta, len, window);
             }
         }
+        Focus::Tabs => {
+            if let Some(id) = current_id(app, snap) {
+                let nav = app.nav_mut(&id);
+                let index = if nav.overview { 0 } else { nav.tab + 1 };
+                let next = step(index, delta, 7);
+                if next == 0 {
+                    nav.overview = true;
+                } else {
+                    nav.overview = false;
+                    nav.tab = next - 1;
+                }
+            }
+        }
         Focus::Overview => {
             if let Some(id) = current_id(app, snap) {
-                let len =
-                    overview_len(app.card(snap), app.nav.get(&id).map(|n| n.tab).unwrap_or(0));
+                let len = crate::screen::compose::feature_len(app, snap);
                 if let Some(nav) = app.nav.get_mut(&id) {
                     list_for_tab(nav).move_by(delta, len, window);
                 }
@@ -1003,25 +1094,67 @@ fn step(index: usize, delta: i32, len: usize) -> usize {
 }
 
 pub fn work_len(card: Option<&Card>) -> usize {
-    let setup = card.is_some_and(|card| card.setup_incomplete);
-    2 + usize::from(setup)
+    coordinator_actions(card).len()
 }
 
-pub fn overview_len(card: Option<&Card>, tab: usize) -> usize {
-    let Some(card) = card else {
-        return 1;
-    };
-    match tab {
-        0 => card.threads.len().max(1) + 1,
-        1 => card.tasks.len().max(1),
-        2 => card.library.len().max(1),
-        3 => card.prs.len().max(1),
-        4 => card.routines.len().max(1),
-        _ => card.resources.len().max(1),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinatorState {
+    Missing,
+    Stale,
+    Ineligible,
+    Recorded,
+}
+
+pub fn coordinator_state(line: &str) -> CoordinatorState {
+    if line.is_empty() || line.contains("none recorded") {
+        CoordinatorState::Missing
+    } else if line.contains("stale") {
+        CoordinatorState::Stale
+    } else if line.contains("no socket") || line.contains("pane none") {
+        CoordinatorState::Ineligible
+    } else {
+        CoordinatorState::Recorded
     }
 }
 
+pub fn coordinator_actions(card: Option<&Card>) -> Vec<(String, Command)> {
+    let line = card.map(|card| card.coordinator.as_str()).unwrap_or("");
+    let mut actions = Vec::new();
+    match coordinator_state(line) {
+        CoordinatorState::Missing => {
+            actions.push(("Start coordinator".into(), Command::StartCoordinator));
+        }
+        CoordinatorState::Stale => {
+            actions.push((
+                "Inspect stale coordinator".into(),
+                Command::InspectCoordinator,
+            ));
+        }
+        CoordinatorState::Ineligible => {
+            actions.push(("Inspect coordinator".into(), Command::InspectCoordinator));
+        }
+        CoordinatorState::Recorded => {
+            actions.push((
+                "Open coordinator in Herdr".into(),
+                Command::OpenConversation,
+            ));
+        }
+    }
+    actions.push(("Send instruction".into(), Command::FocusPrompt));
+    if card.is_some_and(|card| card.setup_incomplete) {
+        actions.push(("Finish setup".into(), Command::FinishSetup));
+    }
+    actions
+}
+
+pub fn showing_overview(nav: Option<&Nav>) -> bool {
+    nav.map(|nav| nav.overview).unwrap_or(true)
+}
+
 fn list_for_tab(nav: &mut Nav) -> &mut ListPos {
+    if nav.overview {
+        return &mut nav.overview_pos;
+    }
     match nav.tab {
         0 => &mut nav.threads,
         1 => &mut nav.tasks,
@@ -1033,6 +1166,9 @@ fn list_for_tab(nav: &mut Nav) -> &mut ListPos {
 }
 
 pub fn tab_list(nav: &Nav) -> &ListPos {
+    if nav.overview {
+        return &nav.overview_pos;
+    }
     match nav.tab {
         0 => &nav.threads,
         1 => &nav.tasks,

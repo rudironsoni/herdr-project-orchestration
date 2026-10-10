@@ -2,7 +2,10 @@
 use ratatui::Terminal;
 #[cfg(test)]
 use ratatui::backend::TestBackend;
+use ratatui::layout::Alignment;
 use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Widget};
 
 use crate::screen::compose;
 use crate::screen::load::Snapshot;
@@ -10,8 +13,17 @@ use crate::screen::state::App;
 
 pub fn draw(frame: &mut ratatui::Frame, app: &App, snap: &Snapshot) {
     let area = frame.area();
-    let lines = compose::plan(app, snap, area.width, area.height);
     let buf = frame.buffer_mut();
+    if compose::framed(area.width, area.height) {
+        let mut block = Block::bordered().title_top(compose::frame_title(app, snap));
+        let status = compose::frame_status(app, snap, area.width);
+        if !status.is_empty() {
+            block = block.title_top(Line::from(status).alignment(Alignment::Right));
+        }
+        block = block.title_bottom(compose::frame_footer(app, area.width));
+        block.render(area, buf);
+    }
+    let lines = compose::plan(app, snap, area.width, area.height);
     for line in lines {
         if line.y >= area.height || line.x >= area.width {
             continue;

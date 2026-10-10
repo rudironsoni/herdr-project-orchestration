@@ -368,10 +368,10 @@ pub(crate) fn build(
         request.slug = card.slug.clone();
         let fallback = Nav::default();
         let nav = app.nav.get(&card.id).unwrap_or(&fallback);
-        if let Some(thread) = card
-            .threads
-            .get(compose::clamp(nav.threads.selected, card.threads.len()))
-        {
+        if let Some(thread) = compose::thread_by_selection(
+            card,
+            compose::clamp(nav.threads.selected, card.threads.len()),
+        ) {
             request.target_id = thread.id.clone();
             request.pane = thread.pane_id.clone();
             request.machine = thread.machine.clone();
@@ -530,6 +530,7 @@ fn intent(command: &Command, request: &Request) -> String {
         Command::Resolve => "resolve".into(),
         Command::NextLine(_) => "next".into(),
         Command::OpenPr => "open_pr".into(),
+        Command::InspectCoordinator | Command::OpenAttention { .. } => String::new(),
         Command::ReadLibrary => "read_library".into(),
         Command::OpenResource => "open_resource".into(),
         Command::SubmitField => "field".into(),
@@ -545,6 +546,7 @@ fn runs(command: &Command) -> bool {
             | Command::FocusNext
             | Command::FocusPrev
             | Command::OpenProjectSelection
+            | Command::ShowOverview
             | Command::SelectTab(_)
             | Command::SelectSide(_)
             | Command::SelectProject(_)
@@ -573,6 +575,8 @@ fn runs(command: &Command) -> bool {
             | Command::FilterInsert(_)
             | Command::FilterBackspace
             | Command::RenameStart
+            | Command::InspectCoordinator
+            | Command::OpenAttention { .. }
     )
 }
 

@@ -1,7 +1,8 @@
 use crate::coordinator::PromptField;
 use crate::screen::load::{Card, Snapshot};
 use crate::screen::state::{
-    App, Columns, Command, Focus, Layer, ListPos, Side, TABS, columns, detail_len, side_len,
+    App, Columns, Command, CoordinatorState, Focus, Layer, ListPos, Side, TABS, columns,
+    coordinator_state, detail_len, showing_overview, side_len,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,87 +21,171 @@ struct Col {
     w: u16,
 }
 
+pub fn framed(width: u16, height: u16) -> bool {
+    width >= 8 && height >= 6
+}
+
+pub fn frame_title(app: &App, snap: &Snapshot) -> String {
+    format!(" {} ", screen_title(app, snap))
+}
+
+pub fn frame_status(app: &App, snap: &Snapshot, width: u16) -> String {
+    let title = frame_title(app, snap);
+    let status = format!(
+        "{} Projects  {} Need you  {} Inbox ",
+        snap.projects.len(),
+        snap.needs.len(),
+        snap.inbox.len()
+    );
+    if title.chars().count() + status.chars().count() + 4 >= width as usize {
+        format!("{} need  {} inbox ", snap.needs.len(), snap.inbox.len())
+    } else {
+        status
+    }
+}
+
+pub fn frame_footer(app: &App, width: u16) -> String {
+    let text =
+        if app.stack.last().is_some_and(|layer| {
+            matches!(layer, Layer::New(_) | Layer::Thread(_) | Layer::Field(_))
+        }) {
+            "Enter confirm  Esc close"
+        } else if app.focus == Focus::Prompt {
+            "Enter send  Esc close"
+        } else {
+            match app.focus {
+                Focus::Global => "Enter open  Tab focus  P projects",
+                Focus::Projects => "Enter select  P projects  / filter  Tab focus",
+                Focus::Work => "Enter run  o coordinator  Tab focus",
+                Focus::Tabs => "Enter tab  Up Down feature  g1-6  Tab focus",
+                Focus::Overview => "Enter inspect  o worker  g1-6  Tab focus",
+                Focus::Prompt => "Enter send  Esc close",
+            }
+        };
+    text.chars()
+        .take(width.saturating_sub(4) as usize)
+        .collect()
+}
+
 pub fn plan(app: &App, snap: &Snapshot, width: u16, height: u16) -> Vec<Placed> {
     let mut out = Vec::new();
     if height == 0 || width == 0 {
         return out;
     }
-    push(
-        &mut out,
-        0,
-        0,
-        width,
-        "HERDR PROJECTS",
-        Command::Nothing,
-        (false, false),
-    );
-    if columns(width) == Columns::TooSmall {
+    if !crate::screen::state::cockpit_fits(width, height) {
         push(
             &mut out,
             0,
-            2,
+            0,
             width,
             "Terminal is too small",
             Command::Nothing,
             (false, false),
         );
-        push(
-            &mut out,
-            0,
-            3,
-            width,
-            &format!("{width}x{height}"),
-            Command::Nothing,
-            (false, false),
-        );
         return out;
     }
-    let body = 1..height;
+    let frame = framed(width, height);
+    let inset = u16::from(frame);
+    let x0 = inset;
+    let x1 = width.saturating_sub(inset);
+    let inner_w = x1.saturating_sub(x0).max(1);
+    let body = inset..height.saturating_sub(inset);
+    let mut splits = Vec::new();
     match columns(width) {
         Columns::Three => {
-            let side = Col {
-                x: 0,
-                w: 34.min(width),
-            };
-            let rest = width.saturating_sub(side.w.saturating_add(1));
+            let side_w = 30.min(inner_w.saturating_sub(4));
+            let sep1 = x0.saturating_add(side_w);
+            let rest = inner_w.saturating_sub(side_w).saturating_sub(2);
             let work_w = (rest / 2).max(1);
+            let sep2 = sep1.saturating_add(1).saturating_add(work_w);
+            let side = Col { x: x0, w: side_w };
             let work = Col {
-                x: side.w.saturating_add(1),
-                w: work_w.min(rest),
+                x: sep1.saturating_add(1),
+                w: work_w,
             };
             let overview = Col {
-                x: work.x.saturating_add(work.w),
-                w: width.saturating_sub(work.x.saturating_add(work.w)),
+                x: sep2.saturating_add(1),
+                w: x1.saturating_sub(sep2.saturating_add(1)),
             };
-            place_side(&mut out, app, snap, &side, body.clone());
-            place_work(&mut out, app, snap, &work, body.clone());
-            place_overview(&mut out, app, snap, &overview, body);
+            splits.extend([sep1, sep2]);
+            let below = head_row(&mut out, &side, body.clone(), "PROJECTS");
+            place_side(&mut out, app, snap, &side, below);
+            let below = head_row(&mut out, &work, body.clone(), &column_name(app, snap));
+            place_work(&mut out, app, snap, &work, below);
+            let below = head_row(&mut out, &overview, body.clone(), "OVERVIEW");
+            place_overview(&mut out, app, snap, &overview, below);
         }
-        Columns::Two => {
-            let work_w = width / 2;
-            let work = Col {
-                x: 0,
-                w: work_w.max(1),
-            };
-            let overview = Col {
-                x: work.w,
-                w: width.saturating_sub(work.w),
-            };
-            place_work(&mut out, app, snap, &work, body.clone());
-            place_overview(&mut out, app, snap, &overview, body);
+        Columns::Stacked => {
+            let col = Col { x: x0, w: inner_w };
+            let (list, work, feature) = stacked_bands(body.start, body.end);
+            let below = head_row(&mut out, &col, list, "PROJECTS");
+            place_side(&mut out, app, snap, &col, below);
+            let below = head_row(&mut out, &col, work, &column_name(app, snap));
+            place_work(&mut out, app, snap, &col, below);
+            let below = head_row(&mut out, &col, feature, "OVERVIEW");
+            place_overview(&mut out, app, snap, &col, below);
         }
-        Columns::One => {
-            let col = Col { x: 0, w: width };
-            if app.one == Focus::Overview {
-                place_overview(&mut out, app, snap, &col, body);
-            } else {
-                place_work(&mut out, app, snap, &col, body);
+        Columns::TooSmall => {
+            push(
+                &mut out,
+                x0,
+                body.start,
+                inner_w,
+                "Terminal is too small",
+                Command::Nothing,
+                (false, false),
+            );
+        }
+    }
+    if frame {
+        for y in body {
+            for x in &splits {
+                push(&mut out, *x, y, 1, "│", Command::Nothing, (false, false));
             }
         }
-        Columns::TooSmall => {}
     }
     place_layer(&mut out, app, snap, width, height);
     out
+}
+
+fn stacked_bands(
+    start: u16,
+    end: u16,
+) -> (
+    std::ops::Range<u16>,
+    std::ops::Range<u16>,
+    std::ops::Range<u16>,
+) {
+    let total = end.saturating_sub(start);
+    let list = ((total as u32 * 40 / 100) as u16)
+        .clamp(4, 8)
+        .min(total.saturating_sub(8));
+    let rest = total.saturating_sub(list);
+    let work = (rest / 2).clamp(4, 9).min(rest.saturating_sub(3));
+    let list_end = start.saturating_add(list);
+    let work_end = list_end.saturating_add(work).min(end);
+    (start..list_end, list_end..work_end, work_end..end)
+}
+
+fn head_row(
+    out: &mut Vec<Placed>,
+    col: &Col,
+    rows: std::ops::Range<u16>,
+    title: &str,
+) -> std::ops::Range<u16> {
+    if rows.start >= rows.end || col.w == 0 {
+        return rows;
+    }
+    push(
+        out,
+        col.x,
+        rows.start,
+        col.w,
+        title,
+        Command::Nothing,
+        (false, false),
+    );
+    rows.start.saturating_add(1)..rows.end
 }
 
 pub fn side_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
@@ -130,13 +215,7 @@ pub fn side_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
                 ) {
                     continue;
                 }
-                rows.push((
-                    format!(
-                        "{} {} {} {}",
-                        card.slug, card.lifecycle, card.availability, card.binding
-                    ),
-                    Command::SelectProject(index),
-                ));
+                rows.push((project_row(snap, card), Command::SelectProject(index)));
             }
             for failed in &snap.failed {
                 rows.push((
@@ -144,6 +223,34 @@ pub fn side_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
                     Command::Nothing,
                 ));
             }
+            let card = app.card(snap);
+            let repos = card
+                .map(|card| {
+                    card.resources
+                        .iter()
+                        .filter(|row| row.kind == "repository")
+                        .count()
+                })
+                .unwrap_or(0);
+            let machines = card
+                .map(|card| {
+                    card.resources
+                        .iter()
+                        .filter(|row| row.kind == "machine")
+                        .count()
+                })
+                .unwrap_or(0);
+            let profiles = card
+                .map(|card| {
+                    card.resources
+                        .iter()
+                        .filter(|row| row.label.starts_with("harness profile"))
+                        .count()
+                })
+                .unwrap_or(0);
+            rows.push((format!("repositories: {repos}"), Command::Nothing));
+            rows.push((format!("machines: {machines}"), Command::Nothing));
+            rows.push((format!("harness profiles: {profiles}"), Command::Nothing));
             rows.push(("Project menu".into(), Command::OpenMenu));
         }
         Side::Needs => {
@@ -158,7 +265,10 @@ pub fn side_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
                     .unwrap_or(0);
                 rows.push((
                     format!("{} {} {}", row.slug, row.thread_id, row.title),
-                    Command::SelectProject(index),
+                    Command::OpenAttention {
+                        project: index,
+                        thread_id: row.thread_id.clone(),
+                    },
                 ));
             }
         }
@@ -189,22 +299,123 @@ fn place_side(
     let selected = clamp(app.side_list.selected, items.len());
     let window = rows.len().max(1);
     let offset = visible_offset(app.side_list.offset, selected, items.len(), window);
-    let focus = app.focus == Focus::Projects && app.stack.is_empty();
+    let focus = matches!(app.focus, Focus::Projects | Focus::Global) && app.stack.is_empty();
     for (slot, (text, command)) in items.into_iter().enumerate().skip(offset).take(window) {
         let y = rows.start + (slot - offset) as u16;
         if y >= rows.end {
             break;
         }
+        let shown = match &command {
+            Command::SelectProject(index) if *index == app.project_ix => format!("> {text}"),
+            _ => text,
+        };
         push(
             out,
             col.x,
             y,
             col.w,
-            &text,
+            &shown,
             command,
             (focus && slot == selected, false),
         );
     }
+}
+
+fn project_row(snap: &Snapshot, card: &Card) -> String {
+    let open = card
+        .threads
+        .iter()
+        .filter(|thread| thread.status == "open")
+        .count();
+    let attention = snap
+        .needs
+        .iter()
+        .filter(|row| row.project_id == card.id)
+        .count();
+    let word = match coordinator_state(&card.coordinator) {
+        CoordinatorState::Missing => "missing",
+        CoordinatorState::Stale => "stale",
+        CoordinatorState::Ineligible => "ineligible",
+        CoordinatorState::Recorded => "socket recorded",
+    };
+    let availability = if card.availability == "available" {
+        String::new()
+    } else {
+        format!(" {}", card.availability)
+    };
+    let name = if card.name.is_empty() {
+        card.slug.as_str()
+    } else {
+        card.name.as_str()
+    };
+    format!(
+        "{} {} {} {} open {} attention{}",
+        card.slug, name, word, open, attention, availability
+    )
+}
+
+fn column_name(app: &App, snap: &Snapshot) -> String {
+    match app.card(snap) {
+        Some(card) if !card.name.is_empty() => format!("SELECTED / {}", card.name),
+        Some(card) => format!("SELECTED / {}", card.slug),
+        None => "SELECTED".into(),
+    }
+}
+
+fn screen_title(_app: &App, _snap: &Snapshot) -> String {
+    "HERDR PROJECTS".into()
+}
+
+fn place_tabs(
+    out: &mut Vec<Placed>,
+    app: &App,
+    col: &Col,
+    y: u16,
+    end: u16,
+    overview: bool,
+    tab: usize,
+) -> u16 {
+    if y >= end {
+        return y;
+    }
+    let mut labels = vec![(
+        if overview {
+            "[OVERVIEW]".into()
+        } else {
+            "[Overview]".into()
+        },
+        Command::ShowOverview,
+        overview && app.focus == Focus::Tabs,
+    )];
+    for (index, name) in TABS.iter().enumerate() {
+        let current = !overview && index == tab;
+        let label = if current {
+            format!("[{}]", name.to_ascii_uppercase())
+        } else {
+            format!("[{name}]")
+        };
+        labels.push((
+            label,
+            Command::SelectTab(index),
+            current && app.focus == Focus::Tabs,
+        ));
+    }
+    let mut x = col.x;
+    let mut y = y;
+    for (label, command, selected) in labels {
+        let width = label.chars().count() as u16;
+        if x > col.x && x.saturating_add(width) > col.x.saturating_add(col.w) {
+            y += 1;
+            if y >= end {
+                return y;
+            }
+            x = col.x;
+        }
+        let width = width.min(col.x.saturating_add(col.w).saturating_sub(x));
+        push(out, x, y, width, &label, command, (selected, false));
+        x = x.saturating_add(width).saturating_add(1);
+    }
+    y + 1
 }
 
 fn place_work(
@@ -214,57 +425,41 @@ fn place_work(
     col: &Col,
     rows: std::ops::Range<u16>,
 ) {
+    if rows.start >= rows.end {
+        return;
+    }
     let card = app.card(snap);
-    let mut lines: Vec<(String, Command, bool)> = vec![(
-        "Current work and recent reports".into(),
-        Command::Nothing,
-        false,
-    )];
+    let mut lines: Vec<(String, Command, bool)> = Vec::new();
+    lines.push(("GOAL".into(), Command::Nothing, false));
     match card {
-        None => lines.push(("no project".into(), Command::Nothing, false)),
+        None => {
+            lines.push(("no project".into(), Command::Nothing, false));
+            lines.push(("COORDINATOR".into(), Command::Nothing, false));
+            lines.push(("No coordinator recorded.".into(), Command::Nothing, false));
+        }
         Some(card) => {
-            lines.push((format!("Goal: {}", card.goal), Command::Nothing, false));
+            let goal = if card.goal.is_empty() {
+                "(none set)".into()
+            } else {
+                card.goal.clone()
+            };
+            lines.push((goal, Command::Nothing, false));
+            lines.push(("COORDINATOR".into(), Command::Nothing, false));
+            lines.push((
+                coordinator_blurb(&card.coordinator),
+                Command::Nothing,
+                false,
+            ));
             lines.push((card.coordinator.clone(), Command::Nothing, false));
-            let repos = card
-                .resources
-                .iter()
-                .filter(|row| row.kind == "repository")
-                .count();
-            let machines: Vec<&str> = card
-                .resources
-                .iter()
-                .filter(|row| row.kind == "machine")
-                .map(|row| row.label.as_str())
-                .collect();
-            let profiles = card
-                .resources
-                .iter()
-                .filter(|row| row.label.starts_with("harness profile"))
-                .count();
-            lines.push((format!("repositories: {repos}"), Command::Nothing, false));
-            lines.push((
-                format!("machines: {}", machines.join(", ")),
-                Command::Nothing,
-                false,
-            ));
-            lines.push((
-                format!("harness profiles: {profiles}"),
-                Command::Nothing,
-                false,
-            ));
-            for thread in card.threads.iter().take(4) {
+            if let Some(thread) = card.threads.first() {
                 lines.push((thread_text(thread), Command::Nothing, false));
             }
-            for report in card.reports.iter().take(3) {
-                lines.push((report.clone(), Command::Nothing, false));
-            }
-            for line in card
-                .operations
+            if let Some(report) = card
+                .reports
                 .iter()
-                .chain(card.recovery.iter())
-                .chain(card.running.iter())
+                .find(|line| !line.contains("no report file"))
             {
-                lines.push((line.clone(), Command::Nothing, false));
+                lines.push((report.clone(), Command::Nothing, false));
             }
             if let Some(id) = app.project_id(snap) {
                 if let Some(prompt) = app.prompts.get(&id) {
@@ -280,28 +475,49 @@ fn place_work(
                     lines.push((notice.clone(), Command::Nothing, false));
                 }
             }
+            let recovery: Vec<String> = card
+                .recovery
+                .iter()
+                .cloned()
+                .chain(
+                    card.operations
+                        .iter()
+                        .filter(|line| !line.starts_with("operation done"))
+                        .cloned(),
+                )
+                .collect();
+            if !recovery.is_empty() {
+                lines.push(("RECOVERY".into(), Command::Nothing, false));
+                for line in recovery {
+                    lines.push((line, Command::Nothing, false));
+                }
+            }
         }
     }
-    let actions = work_actions(card);
-    let tail_count = actions.len() + 1;
+    let actions = crate::screen::state::coordinator_actions(card);
+    let prompt_focused = app.focus == Focus::Prompt && app.stack.is_empty();
     let nav = card.and_then(|card| app.nav.get(&card.id));
     let action_at = nav
         .map(|nav| clamp(nav.work.selected, actions.len()))
         .unwrap_or(0);
+    let mut tail_count = actions.len();
     for (index, (text, command)) in actions.into_iter().enumerate() {
         lines.push((text, command, index == action_at));
     }
-    let prompt_focused = app.focus == Focus::Prompt && app.stack.is_empty();
-    let (word, draft) = prompt_bits(app, snap);
-    lines.push((
-        format!("{word}: {draft}"),
-        if prompt_focused {
-            Command::SubmitPrompt
-        } else {
-            Command::FocusPrompt
-        },
-        prompt_focused,
-    ));
+    if prompt_focused {
+        let (word, draft) = prompt_bits(app, snap);
+        if word == "Uncertain" {
+            lines.push((
+                "DELIVERY UNCERTAIN. Herdr did not confirm the prompt. It will not be sent again."
+                    .into(),
+                Command::Nothing,
+                false,
+            ));
+            tail_count += 1;
+        }
+        lines.push((format!("{word}: {draft}"), Command::SubmitPrompt, true));
+        tail_count += 1;
+    }
     let focus_work = app.focus == Focus::Work && app.stack.is_empty();
     let window = rows.end.saturating_sub(rows.start) as usize;
     if window > 0 && lines.len() > window {
@@ -316,24 +532,29 @@ fn place_work(
             lines.into_iter().take(status_room).collect(),
             focus_work,
         );
-        paint_lines(out, col, status_end..rows.end, tail, focus_work);
+        paint_lines(
+            out,
+            col,
+            status_end..rows.end,
+            tail,
+            focus_work || prompt_focused,
+        );
     } else {
-        paint_lines(out, col, rows, lines, focus_work);
+        paint_lines(out, col, rows, lines, focus_work || prompt_focused);
     }
 }
 
-fn work_actions(card: Option<&Card>) -> Vec<(String, Command)> {
-    let mut actions = vec![
-        (
-            "Open conversation in Herdr".into(),
-            Command::OpenConversation,
-        ),
-        ("Start coordinator".into(), Command::StartCoordinator),
-    ];
-    if card.is_some_and(|card| card.setup_incomplete) {
-        actions.push(("Finish setup".into(), Command::FinishSetup));
+fn coordinator_blurb(line: &str) -> String {
+    match coordinator_state(line) {
+        CoordinatorState::Missing => "No coordinator recorded.".into(),
+        CoordinatorState::Stale => {
+            "Stale coordinator. A missing socket is not a live agent.".into()
+        }
+        CoordinatorState::Ineligible => "Coordinator record is not eligible to focus.".into(),
+        CoordinatorState::Recorded => {
+            "Socket recorded. A socket is not proof the agent is running.".into()
+        }
     }
-    actions
 }
 
 fn place_overview(
@@ -348,35 +569,14 @@ fn place_overview(
         return;
     }
     let card = app.card(snap);
-    let tab = card
-        .and_then(|card| app.nav.get(&card.id).map(|nav| nav.tab))
-        .unwrap_or(0);
+    let nav = card.and_then(|card| app.nav.get(&card.id));
+    let overview = showing_overview(nav);
+    let tab = nav.map(|nav| nav.tab).unwrap_or(0);
     let mut y = rows.start;
-    let label = TABS
-        .iter()
-        .enumerate()
-        .map(|(index, name)| {
-            if index == tab {
-                format!("[{name}]")
-            } else {
-                (*name).to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
     if y < rows.end {
-        push(
-            out,
-            col.x,
-            y,
-            col.w,
-            &label,
-            Command::Nothing,
-            (false, false),
-        );
-        y += 1;
+        y = place_tabs(out, app, col, y, rows.end, overview, tab);
     }
-    let items = overview_rows(card, tab);
+    let items = feature_rows(app, snap);
     let pos = card
         .and_then(|card| app.nav.get(&card.id))
         .map(crate::screen::state::tab_list)
@@ -386,9 +586,30 @@ fn place_overview(
     let window = (rows.end.saturating_sub(y)) as usize;
     let offset = visible_offset(pos.offset, selected, items.len(), window.max(1));
     let focus = app.focus == Focus::Overview && app.stack.is_empty();
+    let mut last_status = String::new();
     for (slot, (text, command)) in items.into_iter().enumerate().skip(offset).take(window) {
         if y >= rows.end {
             break;
+        }
+        if !overview
+            && tab == 0
+            && let Some(thread) = card.and_then(|card| thread_by_selection(card, slot))
+            && thread.status != last_status
+        {
+            push(
+                out,
+                col.x,
+                y,
+                col.w,
+                &format!("group {}", thread.status),
+                Command::Nothing,
+                (false, false),
+            );
+            last_status = thread.status.clone();
+            y += 1;
+            if y >= rows.end {
+                break;
+            }
         }
         push(
             out,
@@ -403,23 +624,19 @@ fn place_overview(
     }
 }
 
-fn overview_rows(card: Option<&Card>, tab: usize) -> Vec<(String, Command)> {
-    let Some(card) = card else {
+pub fn feature_len(app: &App, snap: &Snapshot) -> usize {
+    feature_rows(app, snap).len()
+}
+
+fn feature_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
+    let Some(card) = app.card(snap) else {
         return vec![("no project".into(), Command::Nothing)];
     };
-    match tab {
-        0 => {
-            let mut rows: Vec<(String, Command)> = if card.threads.is_empty() {
-                vec![("none".into(), Command::Nothing)]
-            } else {
-                card.threads
-                    .iter()
-                    .map(|thread| (thread_text(thread), Command::Inspect))
-                    .collect()
-            };
-            rows.push(("Start thread".into(), Command::StartThreadForm));
-            rows
-        }
+    if showing_overview(app.nav.get(&card.id)) {
+        return summary_rows(app, snap, card);
+    }
+    match app.nav.get(&card.id).map(|nav| nav.tab).unwrap_or(0) {
+        0 => thread_rows_for(card),
         1 => item_rows(
             &card.tasks,
             "none",
@@ -469,6 +686,162 @@ fn overview_rows(card: Option<&Card>, tab: usize) -> Vec<(String, Command)> {
     }
 }
 
+fn thread_rows_for(card: &Card) -> Vec<(String, Command)> {
+    let mut rows = Vec::new();
+    if card.threads.is_empty() {
+        rows.push(("No Threads yet".into(), Command::Nothing));
+    } else {
+        for index in thread_order(card) {
+            if let Some(thread) = card.threads.get(index) {
+                rows.push((thread_text(thread), Command::Inspect));
+            }
+        }
+    }
+    let start = if card.threads.is_empty() {
+        "Start first Thread"
+    } else {
+        "Start thread"
+    };
+    rows.push((start.into(), Command::StartThreadForm));
+    rows
+}
+
+fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command)> {
+    let _ = app;
+    let mut rows = Vec::new();
+    let open = card
+        .threads
+        .iter()
+        .filter(|thread| thread.status == "open")
+        .count();
+    let failed = card
+        .threads
+        .iter()
+        .filter(|thread| thread.status == "failed")
+        .count();
+    let resolved = card
+        .threads
+        .iter()
+        .filter(|thread| thread.status == "resolved")
+        .count();
+    let project = snap
+        .projects
+        .iter()
+        .position(|item| item.id == card.id)
+        .unwrap_or(0);
+    rows.push(("WORK".into(), Command::Nothing));
+    rows.push((
+        format!("{open} open  {failed} failed  {resolved} resolved"),
+        Command::Nothing,
+    ));
+    rows.push(("NEEDS ATTENTION".into(), Command::Nothing));
+    let needs: Vec<_> = snap
+        .needs
+        .iter()
+        .filter(|row| row.project_id == card.id)
+        .take(3)
+        .collect();
+    if needs.is_empty() {
+        rows.push(("none".into(), Command::Nothing));
+    } else {
+        for row in needs {
+            rows.push((
+                format!("{} {}", row.thread_id, row.title),
+                Command::OpenAttention {
+                    project,
+                    thread_id: row.thread_id.clone(),
+                },
+            ));
+        }
+    }
+    rows.push(("ACTIVE".into(), Command::Nothing));
+    let active: Vec<_> = card
+        .threads
+        .iter()
+        .filter(|thread| thread.status == "open" && !thread.pane_id.is_empty())
+        .take(3)
+        .collect();
+    if active.is_empty() {
+        rows.push(("none recorded".into(), Command::Nothing));
+    } else {
+        for thread in active {
+            rows.push((
+                thread_text(thread),
+                Command::OpenAttention {
+                    project,
+                    thread_id: thread.id.clone(),
+                },
+            ));
+        }
+    }
+    rows.push(("RECENT".into(), Command::Nothing));
+    let mut reports = 0;
+    for report in card
+        .reports
+        .iter()
+        .filter(|line| !line.contains("no report file"))
+        .take(2)
+    {
+        rows.push((report.clone(), Command::Nothing));
+        reports += 1;
+    }
+    if reports == 0 {
+        rows.push(("no report".into(), Command::Nothing));
+    }
+    rows.push(("HEALTH".into(), Command::Nothing));
+    rows.push((coordinator_blurb(&card.coordinator), Command::Nothing));
+    let mut recovery = 0;
+    for line in card
+        .recovery
+        .iter()
+        .chain(
+            card.operations
+                .iter()
+                .filter(|line| !line.starts_with("operation done")),
+        )
+        .take(3)
+    {
+        rows.push((line.clone(), Command::Nothing));
+        recovery += 1;
+    }
+    if recovery == 0 {
+        rows.push(("no recovery".into(), Command::Nothing));
+    }
+    if card.threads.is_empty() {
+        rows.push(("Start first Thread".into(), Command::StartThreadForm));
+    }
+    rows
+}
+
+pub fn thread_order(card: &Card) -> Vec<usize> {
+    let mut indexed: Vec<(usize, &str)> = card
+        .threads
+        .iter()
+        .enumerate()
+        .map(|(index, thread)| (index, thread.status.as_str()))
+        .collect();
+    indexed.sort_by(|left, right| left.1.cmp(right.1).then(left.0.cmp(&right.0)));
+    indexed.into_iter().map(|(index, _)| index).collect()
+}
+
+pub fn thread_by_selection(
+    card: &Card,
+    selected: usize,
+) -> Option<&crate::screen::load::ThreadLine> {
+    let order = thread_order(card);
+    order
+        .get(selected)
+        .and_then(|index| card.threads.get(*index))
+}
+
+pub fn display_index(card: &Card, id: &str) -> Option<usize> {
+    thread_order(card).into_iter().position(|index| {
+        card.threads
+            .get(index)
+            .is_some_and(|thread| thread.id == id)
+    })
+}
+
 fn item_rows<T>(
     rows: &[T],
     empty: &str,
@@ -496,7 +869,7 @@ fn place_detail(
         .map(|nav| clamp(nav.detail.selected, items.len()))
         .unwrap_or(0);
     let tab = card_nav(app, snap).map(|nav| nav.tab).unwrap_or(0);
-    let title = TABS.get(tab).copied().unwrap_or("Overview");
+    let title = format!("[< {}]", TABS.get(tab).copied().unwrap_or("Threads"));
     let mut y = rows.start;
     if y < rows.end {
         push(
@@ -504,8 +877,8 @@ fn place_detail(
             col.x,
             y,
             col.w,
-            title,
-            Command::Nothing,
+            &title,
+            Command::Cancel,
             (false, false),
         );
         y += 1;
@@ -538,10 +911,10 @@ pub fn detail_rows(app: &App, snap: &Snapshot) -> Vec<(String, Command)> {
                 let index = card_nav(app, snap)
                     .map(|nav| clamp(nav.threads.selected, card.threads.len()))
                     .unwrap_or(0);
-                card.threads.get(index)
+                thread_by_selection(card, index)
             });
             let head = thread
-                .map(|thread| format!("{} {} pane {}", thread.id, thread.status, thread.pane_id))
+                .map(|thread| format!("{} {} {}", thread.id, thread.title, thread.status))
                 .unwrap_or_else(|| "no thread".into());
             let mut rows = vec![
                 (head, Command::Nothing),
@@ -701,11 +1074,35 @@ fn place_layer(out: &mut Vec<Placed>, app: &App, snap: &Snapshot, width: u16, he
         Layer::Detail => Vec::new(),
     };
     let selected = layer_selected(app, layer, rows.len());
-    for (y, (index, (text, command))) in (1u16..).zip(rows.into_iter().enumerate()) {
+    let narrow = width < 100;
+    let offset = if narrow {
+        match layer {
+            Layer::Picker => app.picker_list.offset,
+            Layer::Menu => app.menu_list.offset,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    for (y, (index, (text, command))) in (1u16..).zip(rows.into_iter().enumerate().skip(offset)) {
         if y >= height {
             break;
         }
-        push(out, x, y, box_w, &text, command, (index == selected, true));
+        let shown = match (&command, narrow) {
+            (Command::SelectProject(index), true) => snap
+                .projects
+                .get(*index)
+                .map(|card| {
+                    if card.name.is_empty() {
+                        card.slug.clone()
+                    } else {
+                        card.name.clone()
+                    }
+                })
+                .unwrap_or(text),
+            _ => text,
+        };
+        push(out, x, y, box_w, &shown, command, (index == selected, true));
     }
 }
 
@@ -783,8 +1180,8 @@ fn new_rows(form: &crate::screen::state::NewForm) -> Vec<(String, Command)> {
             Command::Nothing,
         ));
     }
-    rows.push(("Advanced".into(), Command::ToggleAdvanced));
-    rows.push(("Create".into(), Command::SubmitNew));
+    rows.push(("Advanced settings".into(), Command::ToggleAdvanced));
+    rows.push(("Create Project".into(), Command::SubmitNew));
     rows.push(("Cancel".into(), Command::Cancel));
     if !form.error.is_empty() {
         rows.push((form.error.clone(), Command::Nothing));
@@ -809,12 +1206,12 @@ fn thread_rows(form: &crate::screen::state::ThreadForm) -> Vec<(String, Command)
         (format!("Machine {}", form.machine), Command::Nothing),
         (format!("Pane {}", form.pane), Command::Nothing),
     ];
-    let submit = if form.allocated.is_some() {
-        Command::Restart
+    let (label, submit) = if form.allocated.is_some() {
+        ("Restart", Command::Restart)
     } else {
-        Command::SubmitThread
+        ("Start Thread", Command::SubmitThread)
     };
-    rows.push(("Start".into(), submit));
+    rows.push((label.into(), submit));
     rows.push(("Cancel".into(), Command::Cancel));
     if !form.error.is_empty() {
         rows.push((form.error.clone(), Command::Nothing));

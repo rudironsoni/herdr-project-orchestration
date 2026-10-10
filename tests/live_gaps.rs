@@ -636,7 +636,8 @@ fn drive_until_marker(world: &World) -> u32 {
     let pid_path = dir.join("pid");
     let steps = serde_json::json!([
         {"wait": "HERDRPROJECTS", "timeout": 8},
-        {"send": "\t"},
+        {"send": "g"},
+        {"send": "1"},
         {"send": "t"},
         {"wait": "Kindworktree", "timeout": 3},
         {"send": "gap"},
@@ -742,8 +743,8 @@ fn prompt_case(world: &World, mode: &str, needle: &str, again: bool) -> String {
     let before = world.prompt_count();
     let mut steps = vec![
         serde_json::json!({"wait": "HERDRPROJECTS", "timeout": 8}),
-        serde_json::json!({"send": "\t"}),
-        serde_json::json!({"send": "\t"}),
+        serde_json::json!({"send": "\u{1b}[B"}),
+        serde_json::json!({"send": "\r"}),
         serde_json::json!({"send": "hello"}),
         serde_json::json!({"send": "\r"}),
         serde_json::json!({"wait": needle, "timeout": 8}),
@@ -881,7 +882,8 @@ fn live_crash_window_open_worker_and_prompt_outcomes() {
         "open-worker",
         serde_json::json!([
             {"wait": "HERDRPROJECTS", "timeout": 8},
-            {"send": "\t"},
+            {"send": "g"},
+            {"send": "1"},
             {"send": "o"},
             {"wait_file": world.focus_marker.to_str().unwrap(), "timeout": 8},
             {"hold": 1},

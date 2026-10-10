@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -28,10 +29,14 @@ pub fn run(ctx: &Ctx, scope: Option<String>) -> Result<()> {
         app.select_slug(&snap, slug);
     }
     let _restorer = Restorer::enter()?;
+    arm_stop();
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut lane = Lane::new();
     let prefix = coordinator::current_prefix(&ctx.root).ok();
     loop {
+        if STOP.load(Ordering::Relaxed) {
+            break;
+        }
         terminal.draw(|frame| draw::draw(frame, &app, &snap))?;
         let area = terminal.size()?;
         if event::poll(Duration::from_millis(50))? {
@@ -121,4 +126,19 @@ fn enable_mouse_capture() -> ratatui::crossterm::event::EnableMouseCapture {
 
 fn disable_mouse_capture() -> ratatui::crossterm::event::DisableMouseCapture {
     ratatui::crossterm::event::DisableMouseCapture
+}
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn on_stop(_: i32) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+fn arm_stop() {
+    let handler = on_stop as *const () as usize;
+    unsafe {
+        crate::runner::set_signal(1, handler);
+        crate::runner::set_signal(2, handler);
+        crate::runner::set_signal(15, handler);
+    }
 }
