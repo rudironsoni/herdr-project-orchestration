@@ -256,6 +256,10 @@ unsafe extern "C" {
     fn signal(signum: i32, handler: usize) -> usize;
 }
 
+pub(crate) unsafe fn set_signal(signum: i32, handler: usize) -> usize {
+    unsafe { signal(signum, handler) }
+}
+
 const SIGINT: i32 = 2;
 const SIGQUIT: i32 = 3;
 const SIG_IGN: usize = 1;
