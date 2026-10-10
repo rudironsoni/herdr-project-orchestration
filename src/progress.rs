@@ -180,6 +180,9 @@ pub fn report(ctx: &Ctx, percent: Option<u8>, activity: &str) -> Result<()> {
         println!("not inside a Herdr pane; nothing reported");
         return Ok(());
     };
+    if !project_pane(&ctx.root, &pane.socket, &pane.pane_id) {
+        return Ok(());
+    }
     if percent.is_some_and(|p| p > 100) {
         bail!("--percent must be 0 to 100");
     }
@@ -369,8 +372,8 @@ pub fn output(harness: &crate::setup::Harness, native: &str, text: &str) -> serd
 }
 
 /// `hook --agent <harness>`, the entry point the harness hooks run. Silent
-/// (exit 0, no output) outside a Herdr pane, so the same hooks may sit in the
-/// user's settings for every session on the machine.
+/// outside a Herdr pane, and silent when that pane is not a coordinator or
+/// thread of a project in this root.
 pub fn hook(ctx: &Ctx, agent: &str) -> Result<()> {
     if ctx.env.var("HERDR_ENV") != Some("1") || ctx.env.var("HERDR_PANE_ID").is_none() {
         return Ok(());
@@ -417,6 +420,9 @@ pub fn hook(ctx: &Ctx, agent: &str) -> Result<()> {
     if !pane.agent.is_empty() && pane.agent != agent {
         return Ok(()); // another harness's hook fired in a pane that is not its own
     }
+    if !project_pane(&ctx.root, &pane.socket, &pane.pane_id) {
+        return Ok(());
+    }
     let mut record = load(&ctx.root, &pane.socket, &pane.pane_id).unwrap_or_default();
     if kind != "SessionStart" && foreign_session(&record, &event) {
         return Ok(());
@@ -455,6 +461,12 @@ pub fn self_report(root: &Path, socket: &str, pane_id: &str, terminal_id: &str) 
         return None;
     }
     record.reported().then_some(record)
+}
+
+fn project_pane(root: &Path, socket: &str, pane_id: &str) -> bool {
+    crate::store::Store::open(root)
+        .and_then(|store| store.has_project_pane(socket, pane_id))
+        .unwrap_or(false)
 }
 
 /// Drops records whose pane is no longer listed in the session they belong to.

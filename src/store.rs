@@ -745,6 +745,35 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// True when this pane is a live coordinator session, or a thread record
+    /// names it. Any other Herdr pane is not a project session.
+    pub fn has_project_pane(&self, socket: &str, pane_id: &str) -> Result<bool> {
+        if pane_id.is_empty() {
+            return Ok(false);
+        }
+        let bound: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE herdr_socket = ?1 AND pane_id = ?2 AND unbound_at IS NULL LIMIT 1",
+                params![socket, pane_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if bound.is_some() {
+            return Ok(true);
+        }
+        let needle = format!("\"pane_id\":\"{pane_id}\"");
+        let thread: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM threads WHERE instr(body, ?1) > 0 LIMIT 1",
+                [needle],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(thread.is_some())
+    }
+
     pub fn session_by_id(&self, id: &str) -> Result<SessionRow> {
         self.conn
             .query_row(
@@ -1567,6 +1596,13 @@ mod tests {
         assert!(old.stale);
         let primary = store.primary_session(&a.id).unwrap().unwrap();
         assert_eq!(primary.id, rebound.id);
+        assert!(store.has_project_pane("/a.sock", "w1:p1").unwrap());
+        assert!(!store.has_project_pane("/a.sock", "w9:p9").unwrap());
+        assert!(!store.has_project_pane("/other.sock", "w1:p1").unwrap());
+        store
+            .save_thread(&a.id, "t-0002", "running", None, r#"{"pane_id":"w2:p4"}"#)
+            .unwrap();
+        assert!(store.has_project_pane("/a.sock", "w2:p4").unwrap());
     }
 
     #[test]
