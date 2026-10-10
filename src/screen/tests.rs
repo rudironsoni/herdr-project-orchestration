@@ -479,10 +479,10 @@ fn contract_cockpit_selects_a_project_without_leaving_the_portfolio() {
     let mut blocked = snap.clone();
     blocked.projects[0].coordinator =
         "coordinator: no socket pane none unnamed profile claude".into();
-    let inspect = line_matching(&app, &blocked, 120, 30, |line| {
-        line.text.starts_with("Inspect coordinator") && !line.text.contains("stale")
+    let start = line_matching(&app, &blocked, 120, 30, |line| {
+        line.text.starts_with("Start coordinator")
     });
-    assert_eq!(inspect.command, Command::InspectCoordinator);
+    assert_eq!(start.command, Command::StartCoordinator);
 
     assert!(
         !snap.needs.is_empty(),
@@ -1503,7 +1503,8 @@ fn contract_open_coordinator_requires_the_live_primary() {
     );
     assert!(!offers_open(card), "{}", card.coordinator);
     let text = frame(&app_on(&snap), &snap, 120, 30);
-    assert!(text.contains("Inspect coordinator"), "{text}");
+    assert!(text.contains("Start coordinator"), "{text}");
+    assert!(!text.contains("Inspect coordinator"), "{text}");
     assert!(!text.contains("Open coordinator in Herdr"), "{text}");
 
     let set = |status: &str| {

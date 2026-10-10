@@ -632,7 +632,7 @@ fn goal_extra_lines(app: &App, snap: &Snapshot, width: u16) -> u16 {
     if card.goal.is_empty() || width <= 1 {
         return 0;
     }
-    let lines = wrap_text(&card.goal, width as usize, 8);
+    let lines = wrap_text(&card.goal, width as usize, card.goal.chars().count().max(1));
     lines.len().saturating_sub(1) as u16
 }
 
@@ -1010,7 +1010,65 @@ fn summary_rows(app: &App, snap: &Snapshot, card: &Card) -> Vec<(String, Command
     if card.threads.is_empty() {
         rows.push(("Start first Thread".into(), Command::StartThreadForm));
     }
+    rows.extend(overview_tail(card, project));
     rows
+}
+
+fn overview_tail(card: &Card, project: usize) -> Vec<(String, Command)> {
+    let mut rows = Vec::new();
+    let mut shown = 0usize;
+    for thread in card.threads.iter().rev() {
+        if shown == 3 {
+            break;
+        }
+        if thread.status == "open" && !thread.pane_id.is_empty() {
+            continue;
+        }
+        let title = if thread.title.is_empty() {
+            thread.id.as_str()
+        } else {
+            thread.title.as_str()
+        };
+        rows.push((
+            format!("{title} {}", thread.status),
+            Command::OpenAttention {
+                project,
+                thread_id: thread.id.clone(),
+            },
+        ));
+        shown += 1;
+    }
+    for file in &card.library {
+        let title = if file.label == "PROJECT.md" {
+            "Instructions"
+        } else if file.label == "MEMORY.md" || file.label.starts_with("memory/") {
+            "Memory"
+        } else if file.label == "AGENTS.md" {
+            "Agents"
+        } else {
+            continue;
+        };
+        rows.push((format!("{title} {}", file.label), Command::ReadLibrary));
+    }
+    rows.push(("Project config".into(), Command::OpenMenu));
+    rows
+}
+
+pub fn overview_library_index(app: &App, snap: &Snapshot) -> Option<usize> {
+    let card = app.card(snap)?;
+    let nav = app.nav.get(&card.id)?;
+    if !nav.overview {
+        return None;
+    }
+    let rows = summary_rows(app, snap, card);
+    let text = rows
+        .get(clamp(nav.overview_pos.selected, rows.len()))
+        .map(|row| row.0.as_str())?;
+    let label = text
+        .strip_prefix("Instructions ")
+        .or_else(|| text.strip_prefix("Memory "))
+        .or_else(|| text.strip_prefix("Agents "))?;
+    card.library.iter().position(|file| file.label == label)
 }
 
 pub fn thread_order(card: &Card) -> Vec<usize> {

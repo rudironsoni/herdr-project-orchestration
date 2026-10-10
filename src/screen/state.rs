@@ -689,6 +689,14 @@ pub fn apply(app: &mut App, command: Command, snap: &Snapshot, width: u16) -> Co
         ),
         Command::ConfirmYes => confirm_yes(app),
         Command::ReadLibrary | Command::Notes => {
+            if matches!(command, Command::ReadLibrary)
+                && let Some(index) = crate::screen::compose::overview_library_index(app, snap)
+                && let Some(id) = app.project_id(snap)
+            {
+                let nav = app.nav_mut(&id);
+                nav.library.selected = index;
+                nav.tab = 2;
+            }
             app.stack.push(Layer::Detail);
             command
         }
@@ -1145,7 +1153,7 @@ pub fn coordinator_actions(card: Option<&Card>) -> Vec<(String, Command)> {
     let line = card.map(|card| card.coordinator.as_str()).unwrap_or("");
     let mut actions = Vec::new();
     match coordinator_state(line) {
-        CoordinatorState::Missing => {
+        CoordinatorState::Missing | CoordinatorState::Ineligible => {
             actions.push(("Start coordinator".into(), Command::StartCoordinator));
         }
         CoordinatorState::Stale => {
@@ -1153,9 +1161,6 @@ pub fn coordinator_actions(card: Option<&Card>) -> Vec<(String, Command)> {
                 "Inspect stale coordinator".into(),
                 Command::InspectCoordinator,
             ));
-        }
-        CoordinatorState::Ineligible => {
-            actions.push(("Inspect coordinator".into(), Command::InspectCoordinator));
         }
         CoordinatorState::Working
         | CoordinatorState::Blocked

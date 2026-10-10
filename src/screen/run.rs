@@ -47,6 +47,11 @@ pub fn run(ctx: &Ctx, scope: Option<String>) -> Result<()> {
                 Event::Mouse(mouse) => {
                     mouse_command(&mut app, &snap, mouse, area.width, area.height)
                 }
+                Event::Resize(_, _) => {
+                    let _ = terminal.clear();
+                    terminal.draw(|frame| draw::draw(frame, &app, &snap))?;
+                    Command::Nothing
+                }
                 _ => Command::Nothing,
             };
             if follow == Command::Quit {

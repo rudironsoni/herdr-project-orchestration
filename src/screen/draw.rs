@@ -25,31 +25,12 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App, snap: &Snapshot) {
             block = block.title_top(Line::styled(status, dim).alignment(Alignment::Right));
         }
         block = block.title_bottom(footer_line(&compose::frame_footer(app, area.width)));
-        let height = panel_height(area.width, area.height, &lines);
-        block.render(
-            Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height,
-            },
-            buf,
-        );
+        block.render(area, buf);
     }
     for line in &lines {
         paint(buf, line, area.width);
     }
     join_panels(buf, &lines);
-}
-
-fn panel_height(width: u16, height: u16, lines: &[Placed]) -> u16 {
-    if crate::screen::state::columns(width) == crate::screen::state::Columns::Three
-        || lines.iter().any(|line| line.modal)
-    {
-        return height;
-    }
-    let last = lines.iter().map(|line| line.y).max().unwrap_or(1);
-    last.saturating_add(2).clamp(6, height)
 }
 
 fn title_line(title: &str) -> Line<'static> {
@@ -318,6 +299,8 @@ fn is_button(command: &Command) -> bool {
         command,
         Command::InspectCoordinator
             | Command::OpenConversation
+            | Command::ReadLibrary
+            | Command::OpenMenu
             | Command::FocusPrompt
             | Command::StartCoordinator
             | Command::FinishSetup
