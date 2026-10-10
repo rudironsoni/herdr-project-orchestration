@@ -1079,13 +1079,7 @@ pub fn finish_setup(project: &Project, prefix: &str) -> Result<()> {
             reconcile_priming(&store, project, &op, prefix)?;
         }
     } else if !project.dir().join("AGENTS.md").exists() {
-        if claude_blocks(project) {
-            return Err(SetupIntervention {
-                path: "CLAUDE.md".into(),
-            }
-            .into());
-        }
-        write_priming(project, prefix)?;
+        recover_priming(project, prefix)?;
     }
     Ok(())
 }
@@ -1120,69 +1114,108 @@ fn reconcile_defaults(
     .into())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimingFile {
+    Missing,
+    Expected,
+    UserOwned,
+    Unreadable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimingChoice {
+    Create,
+    Recognize,
+    Intervene { path: &'static str },
+}
+
+fn priming_decision(agents: PrimingFile, claude: PrimingFile) -> PrimingChoice {
+    match agents {
+        PrimingFile::UserOwned | PrimingFile::Unreadable => {
+            PrimingChoice::Intervene { path: "AGENTS.md" }
+        }
+        PrimingFile::Missing => match claude {
+            PrimingFile::Missing | PrimingFile::Expected => PrimingChoice::Create,
+            PrimingFile::UserOwned | PrimingFile::Unreadable => {
+                PrimingChoice::Intervene { path: "CLAUDE.md" }
+            }
+        },
+        PrimingFile::Expected => match claude {
+            PrimingFile::Missing | PrimingFile::Expected => PrimingChoice::Recognize,
+            PrimingFile::UserOwned | PrimingFile::Unreadable => {
+                PrimingChoice::Intervene { path: "CLAUDE.md" }
+            }
+        },
+    }
+}
+
+fn classify_agents(path: &Path, expected: &str) -> PrimingFile {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PrimingFile::Missing,
+        Err(_) => PrimingFile::Unreadable,
+        Ok(_) => match std::fs::read_to_string(path) {
+            Ok(text) if text == expected => PrimingFile::Expected,
+            Ok(_) => PrimingFile::UserOwned,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PrimingFile::Missing,
+            Err(_) => PrimingFile::Unreadable,
+        },
+    }
+}
+
+fn classify_claude(path: &Path) -> PrimingFile {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PrimingFile::Missing,
+        Err(_) => PrimingFile::Unreadable,
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(path) {
+            Ok(target) if target == Path::new("AGENTS.md") => PrimingFile::Expected,
+            Ok(_) => PrimingFile::UserOwned,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PrimingFile::Missing,
+            Err(_) => PrimingFile::Unreadable,
+        },
+        Ok(_) => PrimingFile::UserOwned,
+    }
+}
+
+fn recover_priming(project: &Project, prefix: &str) -> Result<()> {
+    let (settings, _) = project.read_project_md()?;
+    let name = display_name(&settings.name, &project.slug);
+    let expected = agents_md(&name, &project.slug, prefix);
+    let dir = project.dir();
+    let agents_path = dir.join("AGENTS.md");
+    let claude_path = dir.join("CLAUDE.md");
+    let agents = classify_agents(&agents_path, &expected);
+    let claude = classify_claude(&claude_path);
+    if let PrimingChoice::Intervene { path } = priming_decision(agents, claude) {
+        return Err(SetupIntervention { path: path.into() }.into());
+    }
+    let agents = classify_agents(&agents_path, &expected);
+    let claude = classify_claude(&claude_path);
+    if let PrimingChoice::Intervene { path } = priming_decision(agents, claude) {
+        return Err(SetupIntervention { path: path.into() }.into());
+    }
+    if agents == PrimingFile::Missing {
+        write_atomic(&agents_path, expected.as_bytes())?;
+    }
+    if claude == PrimingFile::Missing {
+        std::os::unix::fs::symlink("AGENTS.md", &claude_path)
+            .with_context(|| format!("could not link {}", claude_path.display()))?;
+    }
+    let uploads = dir.join("uploads");
+    if !uploads.exists() {
+        std::fs::create_dir(&uploads)?;
+    }
+    write_default_routine(project)?;
+    Ok(())
+}
+
 fn reconcile_priming(
     store: &Store,
     project: &Project,
     op: &crate::store::OperationRow,
     prefix: &str,
 ) -> Result<()> {
-    let (settings, _) = project.read_project_md()?;
-    let name = display_name(&settings.name, &project.slug);
-    let expected = agents_md(&name, &project.slug, prefix);
-    let path = project.dir().join("AGENTS.md");
-    match std::fs::read_to_string(&path) {
-        Err(_) if !path.exists() => {
-            if claude_blocks(project) {
-                return Err(SetupIntervention {
-                    path: "CLAUDE.md".into(),
-                }
-                .into());
-            }
-            write_priming(project, prefix)?;
-            store.finish_operation(&op.id, "done", "")?;
-            Ok(())
-        }
-        Ok(text) if text == expected => {
-            if claude_blocks(project) {
-                return Err(SetupIntervention {
-                    path: "CLAUDE.md".into(),
-                }
-                .into());
-            }
-            ensure_missing_priming_links(project)?;
-            store.finish_operation(&op.id, "done", "")?;
-            Ok(())
-        }
-        _ => Err(SetupIntervention {
-            path: "AGENTS.md".into(),
-        }
-        .into()),
-    }
-}
-
-fn claude_blocks(project: &Project) -> bool {
-    let path = project.dir().join("CLAUDE.md");
-    match std::fs::symlink_metadata(&path) {
-        Err(_) => false,
-        Ok(meta) => {
-            if !meta.file_type().is_symlink() {
-                return true;
-            }
-            std::fs::read_link(&path).ok().as_deref() != Some(std::path::Path::new("AGENTS.md"))
-        }
-    }
-}
-
-fn ensure_missing_priming_links(project: &Project) -> Result<()> {
-    let dir = project.dir();
-    let claude = dir.join("CLAUDE.md");
-    if !claude.exists() && std::fs::symlink_metadata(&claude).is_err() {
-        std::os::unix::fs::symlink("AGENTS.md", &claude)?;
-    }
-    if !dir.join("uploads").exists() {
-        std::fs::create_dir(dir.join("uploads"))?;
-    }
-    write_default_routine(project)?;
+    recover_priming(project, prefix)?;
+    store.finish_operation(&op.id, "done", "")?;
     Ok(())
 }
 
@@ -2191,6 +2224,38 @@ mod tests {
                 .exists()
         );
         assert!(setup_incomplete(&project).unwrap());
+    }
+
+    #[test]
+    fn priming_decision_covers_every_ownership_pair() {
+        use PrimingChoice::{Create, Intervene, Recognize};
+        use PrimingFile::{Expected, Missing, Unreadable, UserOwned};
+        let cases = [
+            (Missing, Missing, Create),
+            (Missing, Expected, Create),
+            (Missing, UserOwned, Intervene { path: "CLAUDE.md" }),
+            (Missing, Unreadable, Intervene { path: "CLAUDE.md" }),
+            (Expected, Missing, Recognize),
+            (Expected, Expected, Recognize),
+            (Expected, UserOwned, Intervene { path: "CLAUDE.md" }),
+            (Expected, Unreadable, Intervene { path: "CLAUDE.md" }),
+            (UserOwned, Missing, Intervene { path: "AGENTS.md" }),
+            (UserOwned, Expected, Intervene { path: "AGENTS.md" }),
+            (UserOwned, UserOwned, Intervene { path: "AGENTS.md" }),
+            (UserOwned, Unreadable, Intervene { path: "AGENTS.md" }),
+            (Unreadable, Missing, Intervene { path: "AGENTS.md" }),
+            (Unreadable, Expected, Intervene { path: "AGENTS.md" }),
+            (Unreadable, UserOwned, Intervene { path: "AGENTS.md" }),
+            (Unreadable, Unreadable, Intervene { path: "AGENTS.md" }),
+        ];
+        assert_eq!(cases.len(), 16);
+        for (agents, claude, choice) in cases {
+            assert_eq!(
+                priming_decision(agents, claude),
+                choice,
+                "{agents:?} {claude:?}"
+            );
+        }
     }
 
     #[test]
