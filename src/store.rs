@@ -12,7 +12,7 @@ use sha2::Digest;
 
 use crate::ids::{self, ENV_LOCAL};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 4;
 pub const REGISTRY_FILE: &str = "registry.sqlite";
 
 const SCHEMA: &str = r#"
@@ -237,6 +237,136 @@ CREATE TABLE legacy_imports (
     project_id TEXT,
     last_attempt TEXT NOT NULL
 );
+
+CREATE TABLE work_items (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('open', 'accepted')),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE workers (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (project_id, label),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE assignments (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    thread_label TEXT NOT NULL,
+    context_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'reserved', 'materializing', 'provisioning',
+        'running', 'reported', 'rework_pending',
+        'recovery_required', 'accepted'
+    )),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+    FOREIGN KEY (work_item_id) REFERENCES work_items(id) ON DELETE RESTRICT,
+    FOREIGN KEY (worker_id) REFERENCES workers(id) ON DELETE RESTRICT
+);
+CREATE UNIQUE INDEX one_active_assignment
+ON assignments(work_item_id)
+WHERE state IN (
+    'reserved', 'materializing', 'provisioning',
+    'running', 'reported', 'rework_pending',
+    'recovery_required'
+);
+
+CREATE TABLE attempts (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    thread_label TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    brief_hash TEXT,
+    state TEXT NOT NULL CHECK (state IN ('reserved', 'rejected', 'reported', 'accepted')),
+    evidence_id TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+    FOREIGN KEY (assignment_id) REFERENCES assignments(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE settlements (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (attempt_id) REFERENCES attempts(id) ON DELETE RESTRICT
+);
+"#;
+
+const UPGRADE_V4: &str = r#"
+CREATE TABLE settlements (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (attempt_id) REFERENCES attempts(id) ON DELETE RESTRICT
+);
+"#;
+
+const UPGRADE_V3: &str = r#"
+CREATE TABLE work_items (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('open', 'accepted')),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE workers (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (project_id, label),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE assignments (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    thread_label TEXT NOT NULL,
+    context_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'reserved', 'materializing', 'provisioning',
+        'running', 'reported', 'rework_pending',
+        'recovery_required', 'accepted'
+    )),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+    FOREIGN KEY (work_item_id) REFERENCES work_items(id) ON DELETE RESTRICT,
+    FOREIGN KEY (worker_id) REFERENCES workers(id) ON DELETE RESTRICT
+);
+CREATE UNIQUE INDEX one_active_assignment
+ON assignments(work_item_id)
+WHERE state IN (
+    'reserved', 'materializing', 'provisioning',
+    'running', 'reported', 'rework_pending',
+    'recovery_required'
+);
+
+CREATE TABLE attempts (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    thread_label TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    brief_hash TEXT,
+    state TEXT NOT NULL CHECK (state IN ('reserved', 'rejected', 'reported', 'accepted')),
+    evidence_id TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+    FOREIGN KEY (assignment_id) REFERENCES assignments(id) ON DELETE RESTRICT
+);
 "#;
 
 const UPGRADE_V2: &str = r#"
@@ -358,6 +488,17 @@ pub struct WorkspaceDraft {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct AttemptRow {
+    pub id: String,
+    pub assignment_id: String,
+    pub thread_label: String,
+    pub payload_hash: String,
+    pub brief_hash: Option<String>,
+    pub state: String,
+    pub evidence_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ThreadRow {
     pub id: String,
     pub project_id: String,
@@ -462,15 +603,31 @@ impl Store {
                     params![SCHEMA_VERSION, now()],
                 )?;
             } else {
-                let applied: i64 = self.conn.query_row(
+                let mut applied: i64 = self.conn.query_row(
                     "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
                     [],
                     |row| row.get(0),
                 )?;
-                if applied == 1 {
+                if applied < 2 {
                     self.conn.execute_batch(UPGRADE_V2)?;
                     self.conn.execute(
                         "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
+                        [now()],
+                    )?;
+                    applied = 2;
+                }
+                if applied < 3 {
+                    self.conn.execute_batch(UPGRADE_V3)?;
+                    self.conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?1)",
+                        [now()],
+                    )?;
+                    applied = 3;
+                }
+                if applied < 4 {
+                    self.conn.execute_batch(UPGRADE_V4)?;
+                    self.conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?1)",
                         [now()],
                     )?;
                 }
@@ -890,6 +1047,293 @@ impl Store {
         )?;
         self.thread_by_label(project_id, label)?
             .context("thread insert was not readable")
+    }
+
+    /// Inserts a thread label. An existing label is an error and the row is left as it was.
+    pub fn insert_thread_new(
+        &self,
+        project_id: &str,
+        label: &str,
+        lifecycle: &str,
+        body: &str,
+    ) -> Result<ThreadRow> {
+        if self.thread_by_label(project_id, label)?.is_some() {
+            bail!("thread {label} already exists");
+        }
+        let id = ids::ThreadId::new().to_string();
+        self.conn.execute(
+            "INSERT INTO threads (id, project_id, workspace_id, label, lifecycle, body) VALUES (?1,?2,NULL,?3,?4,?5)",
+            params![id, project_id, label, lifecycle, body],
+        )?;
+        self.thread_by_label(project_id, label)?
+            .context("thread insert was not readable")
+    }
+
+    pub fn insert_work_item(&self, project_id: &str, id: &str, title: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO work_items (id, project_id, title, state, created_at) VALUES (?1,?2,?3,'open',?4)",
+            params![id, project_id, title, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn work_item_state(&self, id: &str) -> Result<(String, String)> {
+        self.conn
+            .query_row(
+                "SELECT project_id, state FROM work_items WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .with_context(|| format!("no work item {id}"))
+    }
+
+    pub fn insert_worker(&self, project_id: &str, id: &str, label: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO workers (id, project_id, label, created_at) VALUES (?1,?2,?3,?4)",
+            params![id, project_id, label, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn worker_project(&self, id: &str) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT project_id FROM workers WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("no worker {id}"))
+    }
+
+    pub fn insert_assignment(
+        &self,
+        id: &str,
+        project_id: &str,
+        work_item_id: &str,
+        worker_id: &str,
+        thread_label: &str,
+        context_hash: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO assignments (
+                id, project_id, work_item_id, worker_id, thread_label, context_hash, state
+             ) VALUES (?1,?2,?3,?4,?5,?6,'reserved')",
+            params![
+                id,
+                project_id,
+                work_item_id,
+                worker_id,
+                thread_label,
+                context_hash
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_attempt(
+        &self,
+        id: &str,
+        project_id: &str,
+        assignment_id: &str,
+        thread_label: &str,
+        payload_hash: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO attempts (
+                id, project_id, assignment_id, thread_label, payload_hash, brief_hash, state, evidence_id
+             ) VALUES (?1,?2,?3,?4,?5,NULL,'reserved',NULL)",
+            params![id, project_id, assignment_id, thread_label, payload_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn attempt_brief_hash(&self, id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT brief_hash FROM attempts WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("no attempt {id}"))
+    }
+
+    pub fn assignment_state(&self, id: &str) -> Result<String> {
+        self.conn
+            .query_row("SELECT state FROM assignments WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .with_context(|| format!("no assignment {id}"))
+    }
+
+    pub fn set_assignment_state(&self, id: &str, state: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE assignments SET state = ?1 WHERE id = ?2",
+            params![state, id],
+        )?;
+        if changed != 1 {
+            bail!("no assignment {id}");
+        }
+        Ok(())
+    }
+
+    pub fn set_attempt_state(&self, id: &str, state: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE attempts SET state = ?1 WHERE id = ?2",
+            params![state, id],
+        )?;
+        if changed != 1 {
+            bail!("no attempt {id}");
+        }
+        Ok(())
+    }
+
+    pub fn set_attempt_brief(&self, id: &str, hash: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE attempts SET brief_hash = ?1 WHERE id = ?2",
+            params![hash, id],
+        )?;
+        if changed != 1 {
+            bail!("no attempt {id}");
+        }
+        Ok(())
+    }
+
+    pub fn claim_operation(&self, id: &str, from_step: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE operations SET step = 'external_call_started', updated_at = ?1
+             WHERE id = ?2 AND step = ?3 AND status = 'pending'",
+            params![now(), id, from_step],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_operation_step(&self, id: &str, step: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE operations SET step = ?1, updated_at = ?2 WHERE id = ?3",
+            params![step, now(), id],
+        )?;
+        if changed != 1 {
+            bail!("no operation {id}");
+        }
+        Ok(())
+    }
+
+    pub fn fail_operation(&self, id: &str, error: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE operations SET status = 'failed', error = ?1, updated_at = ?2 WHERE id = ?3",
+            params![error, now(), id],
+        )?;
+        if changed != 1 {
+            bail!("no operation {id}");
+        }
+        Ok(())
+    }
+
+    pub fn work_item_title(&self, id: &str) -> Result<String> {
+        self.conn
+            .query_row("SELECT title FROM work_items WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .with_context(|| format!("no work item {id}"))
+    }
+
+    pub fn set_work_item_state(&self, id: &str, state: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE work_items SET state = ?1 WHERE id = ?2",
+            params![state, id],
+        )?;
+        if changed != 1 {
+            bail!("no work item {id}");
+        }
+        Ok(())
+    }
+
+    pub fn assignment_worker(&self, id: &str) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT worker_id FROM assignments WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("no assignment {id}"))
+    }
+
+    pub fn assignment_context(&self, id: &str) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT context_hash FROM assignments WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("no assignment {id}"))
+    }
+
+    pub fn assignment_work_item(&self, id: &str) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT work_item_id FROM assignments WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("no assignment {id}"))
+    }
+
+    pub fn attempt(&self, id: &str) -> Result<AttemptRow> {
+        self.conn
+            .query_row(
+                "SELECT id, assignment_id, thread_label, payload_hash, brief_hash, state, evidence_id
+                 FROM attempts WHERE id = ?1",
+                [id],
+                read_attempt,
+            )
+            .with_context(|| format!("no attempt {id}"))
+    }
+
+    pub fn open_attempt_for_thread(
+        &self,
+        project_id: &str,
+        label: &str,
+    ) -> Result<Option<AttemptRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, assignment_id, thread_label, payload_hash, brief_hash, state, evidence_id
+                 FROM attempts
+                 WHERE project_id = ?1 AND thread_label = ?2 AND state != 'rejected'
+                 ORDER BY id DESC LIMIT 1",
+                params![project_id, label],
+                read_attempt,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn seal_attempt(&self, id: &str, evidence: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE attempts SET evidence_id = ?1 WHERE id = ?2 AND evidence_id IS NULL AND state = 'reserved'",
+            params![evidence, id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn insert_settlement(&self, id: &str, attempt_id: &str, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settlements (id, attempt_id, reason, created_at) VALUES (?1,?2,?3,?4)",
+            params![id, attempt_id, reason, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn active_assignment_count(&self, project_id: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM assignments WHERE project_id = ?1 AND state IN (
+                    'reserved', 'materializing', 'provisioning',
+                    'running', 'reported', 'rework_pending', 'recovery_required'
+                 )",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn thread_by_label(&self, project_id: &str, label: &str) -> Result<Option<ThreadRow>> {
@@ -1405,6 +1849,18 @@ pub struct EnvironmentRow {
     pub state: String,
 }
 
+fn read_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
+    Ok(AttemptRow {
+        id: row.get(0)?,
+        assignment_id: row.get(1)?,
+        thread_label: row.get(2)?,
+        payload_hash: row.get(3)?,
+        brief_hash: row.get(4)?,
+        state: row.get(5)?,
+        evidence_id: row.get(6)?,
+    })
+}
+
 fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
     Ok(OperationRow {
         id: row.get(0)?,
@@ -1534,6 +1990,26 @@ mod tests {
         let (check, fk) = store.integrity().unwrap();
         assert_eq!(check, "ok");
         assert!(fk.is_empty());
+        let owner = store.schema_sql("one_active_assignment").unwrap().unwrap();
+        assert!(owner.contains("work_item_id"));
+        assert!(owner.contains("recovery_required"));
+        assert!(!owner.contains("accepted"));
+    }
+
+    #[test]
+    fn insert_thread_new_does_not_replace_an_existing_label() {
+        let (_dir, store) = fresh();
+        let row = project(&store, "demo");
+        store
+            .insert_thread_new(&row.id, "t-0001", "provisioning", "old")
+            .unwrap();
+        let err = store
+            .insert_thread_new(&row.id, "t-0001", "running", "new")
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        let saved = store.thread_by_label(&row.id, "t-0001").unwrap().unwrap();
+        assert_eq!(saved.body, "old");
+        assert_eq!(saved.lifecycle, "provisioning");
     }
 
     #[test]

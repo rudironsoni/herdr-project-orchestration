@@ -624,6 +624,9 @@ fn repo_space(herdr: &crate::herdr::Herdr, repo: &str) -> String {
 /// The thread directory, the git exclude and `brief.md`, on the thread's own
 /// machine. The brief never refers to a path on another machine.
 fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> Result<()> {
+    if crate::work::publish_managed_brief(project, placed)?.is_some() {
+        return Ok(());
+    }
     if !placed.is_remote() {
         return write_brief_local(ctx, project, placed, restart);
     }

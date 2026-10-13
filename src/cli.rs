@@ -1,7 +1,7 @@
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::coordinator::{self, OpenOptions};
@@ -39,6 +39,106 @@ impl From<SessionArgs> for SessionFlags {
             socket: args.socket,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum WorkCommand {
+    /// Add a work item
+    Add { slug: String, title: String },
+    /// Workers
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
+    /// Reserve one assignment. This does not call Herdr.
+    Assign {
+        slug: String,
+        /// Work item id (`wrk_`)
+        #[arg(long)]
+        item: String,
+        /// Worker id (`wkr_`)
+        #[arg(long)]
+        worker: String,
+        #[arg(long)]
+        task: String,
+    },
+    /// Show one reserved operation
+    Show {
+        slug: String,
+        /// Operation id from `work assign`
+        #[arg(long)]
+        operation: String,
+    },
+    /// Create the reserved thread's checkout and write its brief
+    Provision {
+        slug: String,
+        #[arg(long)]
+        operation: String,
+    },
+    /// Record whether an uncertain provision created a checkout
+    Reconcile {
+        slug: String,
+        #[arg(long)]
+        operation: String,
+        /// `none`, or the checkout path that was created
+        #[arg(long)]
+        effect: String,
+    },
+    /// Start a new attempt after `reconcile --effect none`
+    Retry {
+        slug: String,
+        #[arg(long)]
+        operation: String,
+    },
+    /// Seal a report for the attempt named in its header
+    Ingest {
+        slug: String,
+        /// Report file. The header names the work item, assignment, and attempt.
+        #[arg(long)]
+        report: std::path::PathBuf,
+    },
+    /// Record that this attempt's turn was settled. This does not accept the evidence.
+    Settle {
+        slug: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Reject sealed evidence and install the next attempt's brief
+    Reject {
+        slug: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Send the installed rework brief once
+    Rework {
+        slug: String,
+        #[arg(long)]
+        operation: String,
+    },
+    /// Accept the sealed evidence for a settled attempt
+    Accept {
+        slug: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        evidence: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkerCommand {
+    /// Add a worker label
+    Add {
+        slug: String,
+        #[arg(long)]
+        label: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -106,6 +206,11 @@ enum Command {
         /// Print without recording the inbox items as seen
         #[arg(long)]
         peek: bool,
+    },
+    /// Managed work: one owner, one thread, repeatable attempts
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
     },
     /// Who TASKS.md tasks may be assigned to: this project's thread profiles, and other machines with their profiles
     Assignable {
@@ -766,6 +871,126 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
+        Command::Work { command } => match command {
+            WorkCommand::Add { slug, title } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                println!("{}", crate::work::add_item(&project, &title)?);
+                Ok(())
+            }
+            WorkCommand::Worker {
+                command: WorkerCommand::Add { slug, label },
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                println!("{}", crate::work::add_worker(&project, &label)?);
+                Ok(())
+            }
+            WorkCommand::Assign {
+                slug,
+                item,
+                worker,
+                task,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let reserved = crate::work::assign(&project, &item, &worker, &task)?;
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    reserved.operation_id,
+                    reserved.assignment_id,
+                    reserved.attempt_id,
+                    reserved.thread_label
+                );
+                Ok(())
+            }
+            WorkCommand::Provision { slug, operation } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let delivery = crate::work::provision_session(&ctx, &project, &operation)?;
+                println!("{}\t{}", delivery.brief_hash, delivery.cwd);
+                Ok(())
+            }
+            WorkCommand::Reconcile {
+                slug,
+                operation,
+                effect,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                if effect == "none" {
+                    crate::work::reconcile_none(&project, &operation)?;
+                    println!("none");
+                } else {
+                    let cwd = effect.strip_prefix("workspace:").unwrap_or(effect.as_str());
+                    let delivery = crate::work::reconcile_workspace(&project, &operation, cwd)?;
+                    println!("{}\t{}", delivery.brief_hash, delivery.cwd);
+                }
+                Ok(())
+            }
+            WorkCommand::Retry { slug, operation } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let reserved = crate::work::retry(&project, &operation)?;
+                println!("{}\t{}", reserved.operation_id, reserved.attempt_id);
+                Ok(())
+            }
+            WorkCommand::Ingest { slug, report } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let text = std::fs::read_to_string(&report)
+                    .with_context(|| format!("could not read {}", report.display()))?;
+                println!("{}", crate::work::ingest(&project, &text)?);
+                Ok(())
+            }
+            WorkCommand::Settle {
+                slug,
+                attempt,
+                reason,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                crate::work::settle(&project, &attempt, &reason)?;
+                println!("{attempt}");
+                Ok(())
+            }
+            WorkCommand::Reject {
+                slug,
+                attempt,
+                evidence,
+                reason,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let next = crate::work::reject(&project, &attempt, &evidence, &reason)?;
+                println!(
+                    "{}\t{}\t{}",
+                    next.operation_id,
+                    next.attempt_id,
+                    next.brief_hash.as_deref().unwrap_or("-")
+                );
+                Ok(())
+            }
+            WorkCommand::Rework { slug, operation } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                crate::work::deliver_rework_session(&ctx, &project, &operation)?;
+                println!("{operation}");
+                Ok(())
+            }
+            WorkCommand::Accept {
+                slug,
+                attempt,
+                evidence,
+            } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                crate::work::accept(&project, &attempt, &evidence)?;
+                println!("{attempt}");
+                Ok(())
+            }
+            WorkCommand::Show { slug, operation } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let reserved = crate::work::resume(&project, &operation)?;
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    reserved.thread_label,
+                    reserved.attempt_id,
+                    reserved.payload_hash,
+                    reserved.brief_hash.as_deref().unwrap_or("-")
+                );
+                Ok(())
+            }
+        },
         Command::List { all } => {
             for slug in project::list_slugs(&ctx.root) {
                 let project = Project::load(&ctx.root, &slug)?;

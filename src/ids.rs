@@ -43,6 +43,11 @@ id_type!(ThreadId, "thr");
 id_type!(SessionId, "ses");
 id_type!(OperationId, "op");
 id_type!(EventId, "evt");
+id_type!(WorkItemId, "wrk");
+id_type!(WorkerId, "wkr");
+id_type!(AssignmentId, "asg");
+id_type!(AttemptId, "atm");
+id_type!(SettlementId, "stl");
 
 /// The local machine. Remote environments use [`EnvironmentId`].
 pub const ENV_LOCAL: &str = "env_local";
